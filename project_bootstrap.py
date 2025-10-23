@@ -25,6 +25,8 @@ import shutil
 import subprocess
 import sys
 import textwrap
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
@@ -36,7 +38,12 @@ DEFAULT_PLACEHOLDER_INTERNAL_CAMEL = "BaseAngularProjects01"
 DEFAULT_PLACEHOLDER_PUBLIC = "BaseAngularProjects01"
 DEFAULT_PLACEHOLDER_PUBLIC_NAME = "Base Angular Projects 01"
 AWS_REGION = "sa-east-1"
+FIREBASE_HOSTING_IP = "199.36.158.100"
+FIREBASE_CNAME = "ghs.googlehosted.com"
 ENVIRONMENTS = ["local", "development", "beta", "prod"]
+RENDER_DEFAULT_PLAN = "starter"
+
+remaining_tasks: List[str] = []
 
 
 class BootstrapError(RuntimeError):
@@ -192,6 +199,7 @@ def validate_prerequisites(features: Set[str]) -> bool:
             print(f" - {cmd}: {hint}")
             if link:
                 print(f"   {link}")
+        print("\nYou can rerun this CLI after installing the missing tools.")
         return False
     return True
 
@@ -337,6 +345,62 @@ def update_firebase_json(root: Path, project_id: str, env_sites: Dict[str, str])
         firebase_json.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
 
+def update_environment_files(root: Path, internal_name: str, features: Set[str]) -> None:
+    env_dir = root / "src" / "environments"
+    if not env_dir.exists():
+        log_remaining("Review environment configuration files (src/environments) manually.")
+        return
+
+    env_files = list(env_dir.glob("environment*.ts"))
+    if not env_files:
+        log_remaining("Environment files missing under src/environments; configure manually.")
+        return
+
+    def desired_api_url(env: str) -> str:
+        if env == "local":
+            return "http://localhost:3000"
+        if "node_api" in features:
+            return f"https://{internal_name}-{env}.onrender.com"
+        return "http://localhost:2829" if env == "local" else "https://api.example.com"
+
+    def desired_cdn_url(env: str) -> str:
+        if env == "local":
+            return "http://localhost:2828"
+        if "aws_s3" in features:
+            return f"https://{internal_name}-{env}.s3.{AWS_REGION}.amazonaws.com"
+        return f"https://{internal_name}-{env}.web.app"
+
+    for path in env_files:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+
+        env_name = "prod"
+        if "development" in path.name:
+            env_name = "development"
+        elif "local" in path.name:
+            env_name = "local"
+        elif "beta" in path.name:
+            env_name = "beta"
+        elif "production" in path.name:
+            env_name = "prod"
+
+        updated = text
+        updated = updated.replace('ENVIRONMENT_NAME: \'prod\'', f"ENVIRONMENT_NAME: '{env_name}'")
+        updated = updated.replace("ENVIRONMENT_NAME: \"prod\"", f'ENVIRONMENT_NAME: "{env_name}"')
+
+        updated = updated.replace('API_URL: \'http://localhost:2829\'', f"API_URL: '{desired_api_url(env_name)}'")
+        updated = updated.replace('API_URL: "http://localhost:2829"', f'API_URL: "{desired_api_url(env_name)}"')
+
+        updated = updated.replace('CDN_URL: \'http://localhost:2828\'', f"CDN_URL: '{desired_cdn_url(env_name)}'")
+        updated = updated.replace('CDN_URL: "http://localhost:2828"', f'CDN_URL: "{desired_cdn_url(env_name)}"')
+
+        if updated != text:
+            path.write_text(updated, encoding="utf-8")
+
+
+
 def copy_build_directories(root: Path, internal_name: str, environments: Sequence[str]) -> None:
     build_dir = root / ".build"
     template_dir = build_dir / "EXAMPLE-web-site-01"
@@ -416,17 +480,119 @@ def create_s3_buckets(internal_name: str, environments: Sequence[str]) -> None:
         cors_path.unlink(missing_ok=True)
 
 
-def check_render_service_availability() -> None:
-    print(
-        textwrap.dedent(
-            """
-            Render.com automation is not currently available via official CLI.
-            After bootstrap completes, please create Node.js services manually:
-              - https://render.com/docs/cli
-              - For each environment (development/beta/prod) create an API service named <internal>-<env>.
-            """
+def render_api_request(method: str, path: str, api_key: str, payload: Optional[dict] = None) -> Tuple[int, str]:
+    url = f"https://api.render.com{path}"
+    data = None
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method=method.upper())
+    req.add_header("Authorization", f"Bearer {api_key}")
+    req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req) as response:
+            return response.getcode(), response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8")
+        return exc.code, body
+
+
+def configure_render_services(
+    internal_name: str,
+    environments: Sequence[str],
+    repo_url: str,
+    branch: str,
+    root_dir: str,
+    build_command: str,
+    start_command: str,
+) -> None:
+    api_key = os.environ.get("RENDER_API_KEY")
+    if not api_key:
+        log_remaining(
+            "Create Render.com Node API services manually (set RENDER_API_KEY to automate)."
         )
-    )
+        return
+
+    for env in environments:
+        if env == "local":
+            continue
+        service_name = f"{internal_name}-{env}-api"
+        payload = {
+            "name": service_name,
+            "type": "web_service",
+            "plan": RENDER_DEFAULT_PLAN,
+            "env": "node",
+            "repo": repo_url,
+            "branch": branch,
+            "rootDir": root_dir,
+            "buildCommand": build_command,
+            "startCommand": start_command,
+            "autoDeploy": True,
+            "serviceDetails": {
+                "env": "node",
+            },
+            "envVars": [
+                {"key": "NODE_ENV", "value": env if env != "prod" else "production"},
+            ],
+        }
+        print(f"\nCreating Render service '{service_name}'...")
+        status, body = render_api_request("POST", "/v1/services", api_key, payload)
+        if status not in (200, 201):
+            print(f"  Render API responded with {status}: {body}")
+            log_remaining(f"Review Render service '{service_name}' creation manually.")
+        else:
+            print(f"  Render service '{service_name}' created (or already exists).")
+
+
+def godaddy_request(method: str, domain: str, path: str, api_key: str, api_secret: str, payload: Optional[list] = None) -> Tuple[int, str]:
+    url = f"https://api.godaddy.com/v1/domains/{domain}{path}"
+    data = None
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method=method.upper())
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Authorization", f"sso-key {api_key}:{api_secret}")
+    try:
+        with urllib.request.urlopen(req) as response:
+            return response.getcode(), response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8")
+        return exc.code, body
+
+
+def configure_godaddy_dns(domain: str, internal_name: str, env_sites: Dict[str, str]) -> None:
+    api_key = os.environ.get("GODADDY_API_KEY")
+    api_secret = os.environ.get("GODADDY_API_SECRET")
+    if not api_key or not api_secret:
+        log_remaining(
+            "Configure GoDaddy DNS records manually (set GODADDY_API_KEY / GODADDY_API_SECRET to automate)."
+        )
+        return
+
+    records = [
+        {"type": "A", "name": "@", "data": FIREBASE_HOSTING_IP, "ttl": 600},
+        {"type": "CNAME", "name": "www", "data": FIREBASE_CNAME, "ttl": 600},
+    ]
+
+    beta_site = env_sites.get("beta")
+    if beta_site:
+        records.append(
+            {
+                "type": "CNAME",
+                "name": "beta",
+                "data": f"{beta_site}.web.app",
+                "ttl": 600,
+            }
+        )
+
+    print(f"\nUpdating GoDaddy DNS records for {domain}...")
+    status, body = godaddy_request("PUT", domain, "/records", api_key, api_secret, records)
+    if status not in (200, 201, 204):
+        print(f"  GoDaddy API responded with {status}: {body}")
+        log_remaining(f"Review DNS configuration for {domain} manually.")
+    else:
+        print("  GoDaddy DNS records updated.")
+
+
 
 
 def summarise_dns_instructions(app_public_name: str, internal_name: str) -> None:
@@ -489,6 +655,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     print("\nUpdating placeholders throughout the repository...")
     replace_placeholders(project_dir, replacements)
+    update_environment_files(project_dir, app_internal_name, stack.features)
 
     firebase_project_id = prompt_non_empty("\nFirebase project id (e.g., app-internal-name-01): ")
     if not args.dry_run:
@@ -500,6 +667,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         update_firebase_json(project_dir, firebase_project_id, env_sites)
     else:
         print("Dry-run enabled: skipping Firebase project/site creation.")
+        env_sites = {}
 
     copy_build_directories(project_dir, app_internal_name, ENVIRONMENTS)
 
@@ -508,27 +676,57 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             create_s3_buckets(app_internal_name, ENVIRONMENTS)
         else:
             print("Dry-run: skipping S3 bucket creation.")
+            log_remaining("Create AWS S3 buckets (dry-run prevented automation).")
     else:
         print("\nAWS S3 buckets not requested; skipping S3 steps.")
 
     if "node_api" in stack.features:
-        check_render_service_availability()
+        service_repo = prompt_non_empty("\nNode API repository URL (e.g., https://github.com/user/app-api.git): ")
+        service_branch = prompt_non_empty("Default branch for Render deployments (e.g., main): ")
+        service_root = input("Root directory for API project (default '.'): ").strip() or "."
+        build_command = input("Render build command (default: npm install && npm run build): ").strip() or "npm install && npm run build"
+        start_command = input("Render start command (default: npm run start): ").strip() or "npm run start"
+        if not args.dry_run:
+            configure_render_services(
+                app_internal_name,
+                ENVIRONMENTS,
+                service_repo,
+                service_branch,
+                service_root,
+                build_command,
+                start_command,
+            )
+        else:
+            print("Dry-run: skipping Render service creation.")
+            log_remaining("Create Render.com services (dry-run prevented automation).")
+    else:
+        print("\nNode API not selected; skipping Render automation.")
 
-    print(
-        textwrap.dedent(
-            f"""
-            Remaining manual steps checklist:
-              1. Review Render.com API service creation for each environment (if Node API selected).
-              2. Review environment configuration files under src/environments/*.ts.
-              3. Confirm .firebaserc and firebase.json host mappings.
-              4. Populate any remaining secrets (.env files, Firebase API keys, Render deploy hooks).
-            """
-        )
-    )
+    domain_configured = False
+    if env_sites and prompt_yes_no("\nConfigure GoDaddy DNS automatically?", default=False):
+        domain_name = prompt_non_empty("Enter purchased domain (e.g., apppublicname.com): ")
+        if not args.dry_run:
+            configure_godaddy_dns(domain_name, app_internal_name, env_sites)
+            domain_configured = True
+        else:
+            print("Dry-run: skipping DNS automation.")
+            log_remaining("Configure GoDaddy DNS records (dry-run prevented automation).")
+    elif env_sites:
+        log_remaining("Configure GoDaddy DNS records (automation skipped by user).")
 
-    summarise_dns_instructions(app_public_name, app_internal_name)
+    if not domain_configured:
+        summarise_dns_instructions(app_public_name, app_internal_name)
 
-    print("\nBootstrap complete. Happy building!\n")
+    log_remaining("Populate secrets and API keys (.env files, Firebase service accounts, Render deploy hooks).")
+    log_remaining("Review Firebase Hosting / Storage rules and security settings.")
+
+    if remaining_tasks:
+        print("\nPending follow-up actions:")
+        for item in remaining_tasks:
+            print(f" - {item}")
+        print()
+
+    print("Bootstrap complete. Happy building!\n")
     return 0
 
 
@@ -541,3 +739,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\nAborted by user.")
         sys.exit(1)
+def log_remaining(task: str) -> None:
+    remaining_tasks.append(task)

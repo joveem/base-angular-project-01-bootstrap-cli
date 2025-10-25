@@ -455,6 +455,7 @@ class PromptManager:
             allow_empty=True,
             validator=validator,
             summary_formatter=formatter,
+            extra_lines=None,
         )
 
     def prompt_choice(

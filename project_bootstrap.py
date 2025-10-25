@@ -10,7 +10,7 @@ The script guides you through:
 4. Creating Firebase projects, hosting sites, Firestore (optional), AWS buckets (optional).
 5. Performing search & replace of project placeholders.
 6. Duplicating build folders and updating Firebase config files.
-7. Summarising remaining manual steps (e.g., Render.com API setup, DNS updates).
+7. Summarising remaining manual steps (e.g., Railway API setup, DNS updates).
 
 The goal is to automate as much of the 13-step workflow as practicable while
 surfacing clear guidance when manual intervention remains necessary.
@@ -42,7 +42,6 @@ AWS_REGION = "sa-east-1"
 FIREBASE_HOSTING_IP = "199.36.158.100"
 FIREBASE_CNAME = "ghs.googlehosted.com"
 ENVIRONMENTS = ["local", "development", "beta", "prod"]
-RENDER_DEFAULT_PLAN = "starter"
 DEFAULT_GITHUB_OWNER = "joveem"
 REMOVABLE_DOMAIN_SUFFIXES: Set[str] = {
     "api",
@@ -208,6 +207,7 @@ class NodeAPIConfig:
     root_dir: str
     build_command: str
     start_command: str
+    railway_project_id: Optional[str] = None
 
 
 @dataclass
@@ -259,11 +259,10 @@ class ExecutionContext:
     step_created_paths: Dict[str, List[Path]] = field(default_factory=dict)
     step_data: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     active_step: Optional[str] = None
-    render_api_key: Optional[str] = field(default_factory=lambda: os.environ.get("RENDER_API_KEY"))
+    railway_api_token: Optional[str] = field(default_factory=lambda: os.environ.get("RAILWAY_API_TOKEN"))
     godaddy_api_key: Optional[str] = field(default_factory=lambda: os.environ.get("GODADDY_API_KEY"))
     godaddy_api_secret: Optional[str] = field(default_factory=lambda: os.environ.get("GODADDY_API_SECRET"))
     domain_configured: bool = False
-    render_owner_id: Optional[str] = None
     frontend_root: Optional[Path] = None
 
     def _require_active_step(self) -> str:
@@ -757,7 +756,7 @@ OPTIONAL_COMMANDS: Dict[str, Tuple[str, str]] = {
     "firebase": ("Install Firebase CLI", "npm install -g firebase-tools"),
     "gcloud": ("Install Google Cloud SDK (for Firestore Admin)", "https://cloud.google.com/sdk/docs/install"),
     "aws": ("Install AWS CLI v2", "https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html"),
-    "render": ("Install Render CLI", "npm install -g render-cli"),
+    "railway": ("Install Railway CLI", "npm install -g @railway/cli"),
 }
 
 
@@ -801,7 +800,7 @@ def validate_prerequisites(features: Set[str]) -> bool:
 
     need_firebase = "firestore" in features or features.intersection({"threejs", "aws_s3", "node_api"})
     need_aws = "aws_s3" in features
-    need_render = "node_api" in features
+    need_railway = "node_api" in features
 
     if need_firebase and not ensure_command_available("firebase"):
         missing.append(("firebase", OPTIONAL_COMMANDS["firebase"]))
@@ -809,8 +808,8 @@ def validate_prerequisites(features: Set[str]) -> bool:
         missing.append(("gcloud", OPTIONAL_COMMANDS["gcloud"]))
     if need_aws and not ensure_command_available("aws"):
         missing.append(("aws", OPTIONAL_COMMANDS["aws"]))
-    if need_render and not ensure_command_available("render"):
-        missing.append(("render", OPTIONAL_COMMANDS["render"]))
+    if need_railway and not ensure_command_available("railway"):
+        missing.append(("railway", OPTIONAL_COMMANDS["railway"]))
 
     if missing:
         print("\nRequired tooling missing. Please install the following before continuing:\n")
@@ -1016,7 +1015,7 @@ def update_environment_files(root: Path, internal_name: str, features: Set[str],
         if env == "local":
             return "http://localhost:3000"
         if "node_api" in features:
-            return f"https://{internal_name}-{env}.onrender.com"
+            return f"https://{internal_name}-{env}.up.railway.app"
         return "http://localhost:2829" if env == "local" else "https://api.example.com"
 
     def desired_cdn_url(env: str) -> str:
@@ -1168,125 +1167,67 @@ def create_s3_buckets(internal_name: str, environments: Sequence[str], ctx: Opti
             )
             created.append(bucket_name)
     return created
-
-
-def render_api_request(method: str, path: str, api_key: str, payload: Optional[dict] = None) -> Tuple[int, str]:
-    url = f"https://api.render.com{path}"
-    data = None
-    if payload is not None:
-        data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data, method=method.upper())
-    req.add_header("Authorization", f"Bearer {api_key}")
-    req.add_header("Content-Type", "application/json")
-    try:
-        with urllib.request.urlopen(req) as response:
-            return response.getcode(), response.read().decode("utf-8")
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8")
-        return exc.code, body
-
-
-def fetch_render_owner_id(api_key: str, ctx: Optional[ExecutionContext] = None) -> Optional[str]:
-    status, body = render_api_request("GET", "/v1/owners", api_key)
-    if status != 200:
-        message = f"Render API responded with {status}: {body}"
-        raise BootstrapError(f"Failed to resolve Render owner id. {message}")
-    try:
-        data = json.loads(body)
-    except json.JSONDecodeError as exc:
-        raise BootstrapError(f"Render owner list response was not valid JSON: {exc}") from exc
-    owners = data.get("owners") if isinstance(data, dict) else data
-    if isinstance(owners, list) and owners:
-        owner = owners[0]
-        owner_id = owner.get("id") if isinstance(owner, dict) else None
-    elif isinstance(data, list) and data:
-        owner = data[0]
-        owner_id = owner.get("id") if isinstance(owner, dict) else None
-    else:
-        owner_id = None
-    if not owner_id:
-        raise BootstrapError("Unable to determine Render owner id from API response.")
-    if ctx is not None:
-        ctx.render_owner_id = owner_id
-    return owner_id
-
-
-def configure_render_services(
+    
+    
+    
+    
+def configure_railway_services(
     internal_name: str,
     environments: Sequence[str],
-    repo_url: str,
-    branch: str,
-    root_dir: str,
-    build_command: str,
-    start_command: str,
-    api_key: str,
-    ctx: Optional[ExecutionContext] = None,
+    node_config: NodeAPIConfig,
 ) -> List[str]:
     created_services: List[str] = []
-    owner_id: Optional[str] = None
-    if ctx and ctx.render_owner_id:
-        owner_id = ctx.render_owner_id
-    else:
-        try:
-            owner_id = fetch_render_owner_id(api_key, ctx)
-        except BootstrapError as exc:
-            message = str(exc)
-            print(f"  Unable to determine Render owner id automatically: {message}")
-            print("  Skipping Render automation for this run.")
-            log_remaining(
-                "Create Render.com services manually (API owner lookup failed or account does not support creation)."
-            )
-            if ctx:
-                ctx.add_step_data("render_owner_error", message)
-            return created_services
+    project_id = (node_config.railway_project_id or "").strip()
+    cli_available = shutil.which("railway") is not None
+
     for env in environments:
         if env == "local":
             continue
         service_name = f"{internal_name}-{env}-api"
-        service_details: Dict[str, Any] = {
-            "env": "node",
-            "buildCommand": build_command,
-            "startCommand": start_command,
-            "buildPlan": RENDER_DEFAULT_PLAN,
-        }
-        payload: Dict[str, Any] = {
-            "name": service_name,
-            "type": "web_service",
-            "repo": repo_url,
-            "branch": branch,
-            "rootDir": root_dir,
-            "autoDeploy": "yes",
-            "serviceDetails": service_details,
-            "ownerId": owner_id,
-            "envVars": [
-                {"key": "NODE_ENV", "value": "production" if env == "prod" else env},
-            ],
-        }
-        print(f"\nCreating Render service '{service_name}'...")
-        status, body = render_api_request("POST", "/v1/services", api_key, payload)
-        if status not in (200, 201):
-            lower_body = body.lower()
-            if "free-tier" in lower_body or "free tier" in lower_body:
-                print("  Render API reports that free-tier accounts cannot create services via API.")
-                print("  Skipping Render automation for remaining environments.")
-                log_remaining(
-                    "Create Render.com services manually (account restricted from API service creation)."
-                )
-                return created_services
-            if status == 409 or "already exists" in lower_body:
-                print(f"  Render service '{service_name}' already exists; skipping.")
-                continue
-            raise BootstrapError(f"Render API responded with {status}: {body}")
-        try:
-            data = json.loads(body)
-        except json.JSONDecodeError as exc:
-            raise BootstrapError(f"Render API returned invalid JSON for '{service_name}': {exc}") from exc
-        service_id = data.get("id")
-        if not service_id:
-            raise BootstrapError(f"Render API response missing service id for '{service_name}'.")
-        created_services.append(service_id)
+        command_parts = ["railway", "service", "create", service_name]
+        if project_id:
+            command_parts.extend(["--project", project_id])
+        if node_config.repo_url:
+            command_parts.extend(["--source", node_config.repo_url])
+        if node_config.branch:
+            command_parts.extend(["--branch", node_config.branch])
+        if node_config.root_dir and node_config.root_dir != ".":
+            command_parts.extend(["--root", node_config.root_dir])
+        suggested_cmd = " ".join(command_parts)
+
+        print(f"\nRailway provisioning for '{service_name}':")
+        if cli_available:
+            print("  Suggested CLI command (run inside your Node API repository):")
+            print(f"    {suggested_cmd}")
+        else:
+            print("  Railway CLI not detected. Install the Railway CLI to run commands like:")
+            print(f"    {suggested_cmd}")
+        print("  After creating the service, configure build and start commands within Railway as needed.")
+
+        log_remaining(
+            f"Create Railway service '{service_name}' (project: {project_id or 'specify project id'}) using the Railway CLI or dashboard."
+        )
+        created_services.append(service_name)
     return created_services
 
+
+def step_configure_railway_services(ctx: ExecutionContext) -> None:
+    node_config = ctx.config.node_api
+    if not node_config:
+        log_remaining("Create Railway services manually (node API configuration missing).")
+        return
+    services = configure_railway_services(
+        ctx.config.app_internal_name,
+        ENVIRONMENTS,
+        node_config,
+    )
+    ctx.add_step_data("railway_services", services)
+
+
+def rollback_delete_railway_services(ctx: ExecutionContext) -> None:
+    services = ctx.get_step_data().get("railway_services", [])
+    if services:
+        log_remaining("Review Railway services created earlier and remove them manually if necessary.")
 
 def godaddy_request(method: str, domain: str, path: str, api_key: str, api_secret: str, payload: Optional[list] = None) -> Tuple[int, str]:
     url = f"https://api.godaddy.com/v1/domains/{domain}{path}"
@@ -1498,6 +1439,7 @@ class Questionnaire:
         "node_root",
         "node_build",
         "node_start",
+        "railway_project_id",
     )
 
     def __init__(self, args: argparse.Namespace, previous_answers: Optional[Dict[str, Any]] = None) -> None:
@@ -1525,6 +1467,7 @@ class Questionnaire:
                 "node_root",
                 "node_build",
                 "node_start",
+                "railway_project_id",
                 "frontend_subdir",
                 "configure_dns",
                 "domain_name",
@@ -1606,6 +1549,8 @@ class Questionnaire:
             return self._ask_node_build()
         if step_id == "node_start":
             return self._ask_node_start()
+        if step_id == "railway_project_id":
+            return self._ask_railway_project_id()
         if step_id == "frontend_subdir":
             return self._ask_frontend_subdir()
         if step_id == "configure_dns":
@@ -1725,7 +1670,7 @@ class Questionnaire:
 
         return self.prompt_manager.prompt_text(
             "node_branch",
-            "  Default branch for Render deployments (e.g., main):",
+            "  Default branch for Railway deployments (e.g., main):",
             default=default,
             allow_empty=False,
             validator=validator,
@@ -1747,7 +1692,7 @@ class Questionnaire:
         default = previous or "npm install && npm run build"
         return self.prompt_manager.prompt_text(
             "node_build",
-            "  Render build command (default: npm install && npm run build):",
+            "  Railway build command (default: npm install && npm run build):",
             default=default,
             allow_empty=True,
             validator=lambda raw: (True, raw or default, None),
@@ -1758,7 +1703,7 @@ class Questionnaire:
         default = previous or "npm run start"
         return self.prompt_manager.prompt_text(
             "node_start",
-            "  Render start command (default: npm run start):",
+            "  Railway start command (default: npm run start):",
             default=default,
             allow_empty=True,
             validator=lambda raw: (True, raw or default, None),
@@ -1775,6 +1720,21 @@ class Questionnaire:
             validator=lambda raw: (True, raw or default, None),
         )
 
+    def _ask_railway_project_id(self) -> PromptOutcome:
+        previous = self.answers.get('railway_project_id')
+        prompt = '  Railway project ID (optional, used for CLI commands):'
+
+        def validator(raw: str) -> Tuple[bool, Any, Optional[str]]:
+            value = raw.strip()
+            return True, value, None
+
+        return self.prompt_manager.prompt_text(
+            'railway_project_id',
+            prompt,
+            default=previous or '',
+            allow_empty=True,
+            validator=validator,
+        )
     def _ask_configure_dns(self) -> PromptOutcome:
         previous = self.answers.get("configure_dns")
         default = previous if previous is not None else False
@@ -1816,12 +1776,14 @@ class Questionnaire:
 
         node_api_config: Optional[NodeAPIConfig] = None
         if stack and "node_api" in stack.features:
+            railway_project_id_value = self.answers.get("railway_project_id") or None
             node_api_config = NodeAPIConfig(
                 repo_url=self.answers.get("node_repo"),
                 branch=self.answers.get("node_branch"),
                 root_dir=self.answers.get("node_root") or ".",
                 build_command=self.answers.get("node_build") or "npm install && npm run build",
                 start_command=self.answers.get("node_start") or "npm run start",
+                railway_project_id=railway_project_id_value,
             )
 
         if not stack or not internal_name or not public_name or not firebase_project:
@@ -1857,6 +1819,7 @@ class Questionnaire:
             "node_root",
             "node_build",
             "node_start",
+            "railway_project_id",
             "frontend_subdir",
             "configure_dns",
             "domain_name",
@@ -1885,11 +1848,6 @@ def delete_s3_bucket(bucket_name: str) -> None:
     print(f"  Removing S3 bucket '{bucket_name}'...")
     run_command(["aws", "s3", "rb", f"s3://{bucket_name}", "--force"])
 
-
-def render_delete_service(service_id: str, api_key: str) -> None:
-    status, body = render_api_request("DELETE", f"/v1/services/{service_id}", api_key)
-    if status not in (200, 202, 204):
-        raise BootstrapError(f"Render API failed to delete service {service_id}: {status} {body}")
 
 
 def restore_godaddy_records(domain: str, records: List[dict], api_key: str, api_secret: str) -> None:
@@ -2060,32 +2018,6 @@ def rollback_delete_s3_buckets(ctx: ExecutionContext) -> None:
         delete_s3_bucket(bucket)
 
 
-def step_configure_render_services(ctx: ExecutionContext) -> None:
-    node_api = ctx.config.node_api
-    if not node_api:
-        raise BootstrapError("Node API configuration missing.")
-    api_key = ctx.render_api_key
-    if not api_key:
-        raise BootstrapError("RENDER_API_KEY not available.")
-    services = configure_render_services(
-        ctx.config.app_internal_name,
-        ENVIRONMENTS,
-        node_api.repo_url,
-        node_api.branch,
-        node_api.root_dir,
-        node_api.build_command,
-        node_api.start_command,
-        api_key,
-    )
-    ctx.add_step_data("created_services", services)
-
-
-def rollback_delete_render_services(ctx: ExecutionContext) -> None:
-    api_key = ctx.render_api_key
-    if not api_key:
-        raise BootstrapError("RENDER_API_KEY not available for rollback.")
-    for service_id in ctx.get_step_data().get("created_services", []):
-        render_delete_service(service_id, api_key)
 
 
 def step_configure_godaddy_dns(ctx: ExecutionContext) -> None:
@@ -2151,12 +2083,9 @@ def build_steps(ctx: ExecutionContext) -> List[Step]:
 
     if "node_api" in features:
         if ctx.config.dry_run:
-            log_remaining("Create Render.com services (dry-run prevented automation).")
+            log_remaining("Create Railway services (dry-run prevented automation).")
         else:
-            if ctx.render_api_key:
-                steps.append(Step("Configure Render services", step_configure_render_services, rollback_delete_render_services))
-            else:
-                log_remaining("Create Render.com services (missing RENDER_API_KEY).")
+            steps.append(Step("Plan Railway services", step_configure_railway_services, rollback_delete_railway_services))
 
     if ctx.config.configure_dns:
         if ctx.config.dry_run:
@@ -2209,7 +2138,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print(f" - Clone template: {'yes' if config.should_clone else 'no'}")
     print(f" - Firebase project id: {config.firebase_project_id}")
     if config.node_api:
-        print(f" - Render repository: {config.node_api.repo_url} ({config.node_api.branch})")
+        print(f" - Railway repository: {config.node_api.repo_url} ({config.node_api.branch})")
+        if config.node_api.railway_project_id:
+            print(f" - Railway project ID: {config.node_api.railway_project_id}")
     if config.configure_dns:
         print(f" - GoDaddy domain: {config.domain_name}")
     print(f" - Dry run mode: {'yes' if config.dry_run else 'no'}")
@@ -2276,7 +2207,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not ctx.domain_configured:
         summarise_dns_instructions(config.app_public_name, config.app_internal_name)
 
-    log_remaining("Populate secrets and API keys (.env files, Firebase service accounts, Render deploy hooks).")
+    log_remaining("Populate secrets and API keys (.env files, Firebase service accounts, Railway deploy hooks).")
     log_remaining("Review Firebase Hosting / Storage rules and security settings.")
 
     if remaining_tasks:

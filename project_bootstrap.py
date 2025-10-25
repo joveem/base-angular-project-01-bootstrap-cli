@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -43,6 +44,27 @@ FIREBASE_HOSTING_IP = "199.36.158.100"
 FIREBASE_CNAME = "ghs.googlehosted.com"
 ENVIRONMENTS = ["local", "development", "beta", "prod"]
 RENDER_DEFAULT_PLAN = "starter"
+DEFAULT_GITHUB_OWNER = "joveem"
+REMOVABLE_DOMAIN_SUFFIXES: Set[str] = {
+    "api",
+    "apis",
+    "ws",
+    "service",
+    "services",
+    "client",
+    "clients",
+    "web",
+    "fe",
+    "be",
+    "frontend",
+    "backend",
+    "front",
+    "back",
+    "app",
+    "apps",
+    "site",
+    "sites",
+}
 
 remaining_tasks: List[str] = []
 
@@ -414,9 +436,14 @@ def prompt_stack_choice() -> StackOption:
         print("Choice out of range. Try again.")
 
 
-def prompt_non_empty(prompt: str) -> str:
+def prompt_non_empty(prompt: str, default: Optional[str] = None) -> str:
     while True:
-        value = input(prompt).strip()
+        suffix = f" [{default}]" if default else ""
+        base_prompt = prompt.rstrip()
+        prompt_text = f"{base_prompt}{suffix}"
+        value = input(f"{prompt_text} ").strip()
+        if default and not value:
+            return default
         if value:
             return value
         print("Value cannot be empty. Try again.")
@@ -899,13 +926,18 @@ def collect_user_config(args: argparse.Namespace) -> UserConfig:
 
     should_clone = prompt_yes_no(f"\nClone template repository into {project_dir}?")
 
-    firebase_project_id = prompt_non_empty("\nFirebase project id (e.g., app-internal-name-01): ")
+    firebase_default = app_internal_name
+    firebase_project_id = prompt_non_empty("\nFirebase project id (e.g., app-internal-name-01):", firebase_default)
 
     node_api_config: Optional[NodeAPIConfig] = None
     if "node_api" in stack.features:
         print("\nNode API configuration for Render.com deployments:")
-        service_repo = prompt_non_empty("  Repository URL (e.g., https://github.com/user/app-api.git): ")
-        service_branch = prompt_non_empty("  Default branch (e.g., main): ")
+        api_repo_default = generate_default_api_repo(app_internal_name)
+        branch_default = "main-01"
+        service_repo = prompt_non_empty(
+            "  Repository URL (e.g., https://github.com/user/app-api.git):", api_repo_default
+        )
+        service_branch = prompt_non_empty("  Default branch (e.g., main):", branch_default)
         service_root = input("  Root directory for API project (default '.'): ").strip() or "."
         build_command = input("  Render build command (default: npm install && npm run build): ").strip() or "npm install && npm run build"
         start_command = input("  Render start command (default: npm run start): ").strip() or "npm run start"
@@ -924,7 +956,8 @@ def collect_user_config(args: argparse.Namespace) -> UserConfig:
     if not args.dry_run:
         configure_dns = prompt_yes_no("\nConfigure GoDaddy DNS automatically after hosting setup?", default=False)
         if configure_dns:
-            domain_name = prompt_non_empty("Enter purchased domain (e.g., apppublicname.com): ")
+            domain_default = generate_default_domain(app_internal_name)
+            domain_name = prompt_non_empty("Enter purchased domain (e.g., apppublicname.com):", domain_default)
 
     return UserConfig(
         stack=stack,
@@ -965,6 +998,101 @@ def discover_angular_roots(base: Path) -> List[Path]:
         if resolved not in candidates:
             candidates.append(resolved)
     return candidates
+
+
+def _run_git_command(args: Sequence[str]) -> Optional[str]:
+    try:
+        result = subprocess.run(["git", *args], text=True, capture_output=True, check=False)
+    except (FileNotFoundError, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+    value = result.stdout.strip()
+    return value or None
+
+
+def _parse_github_owner_from_remote(remote_url: str) -> Optional[str]:
+    remote_url = remote_url.strip()
+    if not remote_url:
+        return None
+    if remote_url.startswith("git@"):
+        _, remainder = remote_url.split(":", 1)
+        owner = remainder.split("/", 1)[0]
+        return owner or None
+    if remote_url.startswith("https://") or remote_url.startswith("http://"):
+        parts = remote_url.split("/")
+        if len(parts) >= 4:
+            return parts[3] or None
+    return None
+
+
+def detect_default_git_owner() -> str:
+    env_keys = ["GITHUB_USER", "GIT_USER", "GIT_USERNAME"]
+    for key in env_keys:
+        value = os.environ.get(key)
+        if value:
+            return value.strip()
+
+    for args in (
+        ["config", "--get", "user.username"],
+        ["config", "--get", "github.user"],
+    ):
+        value = _run_git_command(args)
+        if value:
+            return value
+
+    remote_url = _run_git_command(["config", "--get", "remote.origin.url"])
+    if remote_url:
+        owner = _parse_github_owner_from_remote(remote_url)
+        if owner:
+            return owner
+
+    return DEFAULT_GITHUB_OWNER
+
+
+def _tokens_without_suffixes(internal_name: str) -> List[str]:
+    tokens = [segment for segment in internal_name.split("-") if segment]
+    while tokens:
+        last = tokens[-1]
+        lowered = last.lower()
+        if lowered in REMOVABLE_DOMAIN_SUFFIXES:
+            tokens.pop()
+            continue
+        if lowered.startswith("v") and lowered[1:].isdigit():
+            tokens.pop()
+            continue
+        if lowered.isdigit():
+            tokens.pop()
+            continue
+        break
+    return tokens if tokens else [internal_name.replace("-", "")]
+
+
+def generate_default_domain(internal_name: str) -> str:
+    tokens = _tokens_without_suffixes(internal_name)
+    domain_root = "".join(tokens).lower()
+    if not domain_root:
+        domain_root = internal_name.replace("-", "")
+    return f"{domain_root}.com"
+
+
+def insert_api_segment(internal_name: str) -> str:
+    parts = [segment for segment in internal_name.split("-") if segment]
+    if not parts:
+        return internal_name
+    if parts[-1].isdigit():
+        return "-".join(parts[:-1] + ["api", parts[-1]])
+    return "-".join(parts + ["api"])
+
+
+def generate_default_api_repo(internal_name: str, owner: Optional[str] = None) -> str:
+    repo_owner = owner or detect_default_git_owner()
+    repo_name = insert_api_segment(internal_name)
+    if not repo_name.endswith(".git"):
+        repo_name_with_suffix = f"{repo_name}.git"
+    else:
+        repo_name_with_suffix = repo_name
+    return f"git@github.com:{repo_owner}/{repo_name_with_suffix}"
 
 
 def delete_firebase_project(project_id: str) -> None:

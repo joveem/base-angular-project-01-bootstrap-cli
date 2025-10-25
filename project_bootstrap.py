@@ -340,9 +340,9 @@ def run_command(command: Sequence[str], cwd: Optional[Path] = None, check: bool 
     try:
         result = subprocess.run(command, cwd=cwd, text=True, capture_output=True)
     except FileNotFoundError as exc:
-        raise BootstrapError(f"Command not found: {command[0]}") from exc
+        raise BootstrapError(f"90-02 | Failed to execute command '{' '.join(command)}': {exc}") from exc
     except Exception as exc:
-        raise BootstrapError(f"Failed to execute command '{' '.join(command)}': {exc}") from exc
+        raise BootstrapError(f"90-01 | Failed to execute command '{' '.join(command)}': {exc}") from exc
 
     if result.stdout:
         print(result.stdout)

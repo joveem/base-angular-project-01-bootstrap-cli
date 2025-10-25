@@ -1085,45 +1085,45 @@ def create_s3_buckets(internal_name: str, environments: Sequence[str], ctx: Opti
             }
             policy_path = tmpdir_path / f"{bucket_name}-policy.json"
             policy_path.write_text(json.dumps(policy, indent=2), encoding="utf-8")
-            print(f"  Applying public-read policy to {bucket_name}...")
-            run_command(
-                [
-                    "aws",
-                    "s3api",
-                    "put-bucket-policy",
-                    "--bucket",
-                    bucket_name,
-                    "--policy",
-                    policy_path.as_uri(),
-                ]
-            )
+        print(f"  Applying public-read policy to {bucket_name}...")
+        run_command(
+            [
+                "aws",
+                "s3api",
+                "put-bucket-policy",
+                "--bucket",
+                bucket_name,
+                "--policy",
+                str(policy_path.resolve()),
+            ]
+        )
 
-            cors_rules = {
-                "CORSRules": [
-                    {
-                        "AllowedHeaders": ["*"],
-                        "AllowedMethods": ["GET", "HEAD"],
+        cors_rules = {
+            "CORSRules": [
+                {
+                    "AllowedHeaders": ["*"],
+                    "AllowedMethods": ["GET", "HEAD"],
                         "AllowedOrigins": ["*"],
                         "ExposeHeaders": ["ETag"],
-                        "MaxAgeSeconds": 3600,
-                    }
-                ]
-            }
-            cors_path = tmpdir_path / f"{bucket_name}-cors.json"
-            cors_path.write_text(json.dumps(cors_rules, indent=2), encoding="utf-8")
-            print(f"  Applying permissive CORS to {bucket_name}...")
-            run_command(
-                [
-                    "aws",
-                    "s3api",
-                    "put-bucket-cors",
-                    "--bucket",
-                    bucket_name,
-                    "--cors-configuration",
-                    cors_path.as_uri(),
-                ]
-            )
-            created.append(bucket_name)
+                    "MaxAgeSeconds": 3600,
+                }
+            ]
+        }
+        cors_path = tmpdir_path / f"{bucket_name}-cors.json"
+        cors_path.write_text(json.dumps(cors_rules, indent=2), encoding="utf-8")
+        print(f"  Applying permissive CORS to {bucket_name}...")
+        run_command(
+            [
+                "aws",
+                "s3api",
+                "put-bucket-cors",
+                "--bucket",
+                bucket_name,
+                "--cors-configuration",
+                str(cors_path.resolve()),
+            ]
+        )
+        created.append(bucket_name)
     return created
 
 

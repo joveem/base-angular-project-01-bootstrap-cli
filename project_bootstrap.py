@@ -67,6 +67,8 @@ REMOVABLE_DOMAIN_SUFFIXES: Set[str] = {
 
 remaining_tasks: List[str] = []
 
+STATE_FILE_PATH = Path(__file__).resolve().with_name(".bootstrap_last_session.json")
+
 
 def log_remaining(task: str) -> None:
     remaining_tasks.append(task)
@@ -165,6 +167,25 @@ STACK_OPTIONS: Sequence[StackOption] = [
         set(),
     ),
 ]
+
+STACK_OPTIONS_BY_KEY = {option.key: option for option in STACK_OPTIONS}
+
+
+def load_last_session() -> Optional[Dict[str, Any]]:
+    if not STATE_FILE_PATH.exists():
+        return None
+    try:
+        data = json.loads(STATE_FILE_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def save_last_session(data: Dict[str, Any]) -> None:
+    try:
+        STATE_FILE_PATH.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    except Exception:
+        pass
 
 
 PLACEHOLDER_EXTENSIONS: Tuple[str, ...] = (
@@ -1344,9 +1365,11 @@ def summarise_dns_instructions(app_public_name: str, internal_name: str) -> None
     )
 
 
-def collect_user_config(args: argparse.Namespace) -> UserConfig:
-    questionnaire = Questionnaire(args)
-    return questionnaire.run()
+def collect_user_config(args: argparse.Namespace, previous_answers: Optional[Dict[str, Any]] = None) -> UserConfig:
+    questionnaire = Questionnaire(args, previous_answers=previous_answers)
+    config = questionnaire.run()
+    save_last_session(questionnaire.export_state())
+    return config
 
 
 def build_replacements(config: UserConfig) -> Dict[str, str]:
@@ -1477,7 +1500,7 @@ class Questionnaire:
         "node_start",
     )
 
-    def __init__(self, args: argparse.Namespace) -> None:
+    def __init__(self, args: argparse.Namespace, previous_answers: Optional[Dict[str, Any]] = None) -> None:
         self.args = args
         self.prompt_manager = PromptManager()
         self.answers: Dict[str, Any] = {}
@@ -1485,6 +1508,29 @@ class Questionnaire:
         self.repo_parent: Path = Path(args.output_dir).expanduser().resolve()
         self.default_owner: str = detect_default_git_owner()
         self.pending_internal_confirm: Optional[str] = None
+        if previous_answers:
+            stack_key = previous_answers.get("stack")
+            if stack_key:
+                stack_option = STACK_OPTIONS_BY_KEY.get(stack_key)
+                if stack_option:
+                    self.stack = stack_option
+                    self.answers["stack"] = stack_option
+            for key in [
+                "app_internal_name",
+                "app_public_name",
+                "should_clone",
+                "firebase_project",
+                "node_repo",
+                "node_branch",
+                "node_root",
+                "node_build",
+                "node_start",
+                "frontend_subdir",
+                "configure_dns",
+                "domain_name",
+            ]:
+                if key in previous_answers:
+                    self.answers[key] = previous_answers[key]
 
     def run(self) -> UserConfig:
         steps: List[str] = [
@@ -1577,6 +1623,8 @@ class Questionnaire:
                 if option == current:
                     default = key
                     break
+        if default is None:
+            default = "1"
         return self.prompt_manager.prompt_choice("stack", "Select the stack configuration:", options, default_option=default)
 
     def _ask_internal_name(self) -> PromptOutcome:
@@ -1794,6 +1842,28 @@ class Questionnaire:
             domain_name=domain_name,
             frontend_subdir=frontend_subdir,
         )
+
+    def export_state(self) -> Dict[str, Any]:
+        state: Dict[str, Any] = {}
+        if self.stack:
+            state["stack"] = self.stack.key
+        for key in [
+            "app_internal_name",
+            "app_public_name",
+            "should_clone",
+            "firebase_project",
+            "node_repo",
+            "node_branch",
+            "node_root",
+            "node_build",
+            "node_start",
+            "frontend_subdir",
+            "configure_dns",
+            "domain_name",
+        ]:
+            if key in self.answers:
+                state[key] = self.answers[key]
+        return state
 
 
 def delete_firebase_project(project_id: str) -> None:
@@ -2119,8 +2189,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    stored_state = load_last_session()
+    previous_answers: Optional[Dict[str, Any]] = None
+    if stored_state:
+        if prompt_yes_no("Reuse answers from last session?", default=True):
+            previous_answers = stored_state
     try:
-        config = collect_user_config(args)
+        config = collect_user_config(args, previous_answers=previous_answers)
     except KeyboardInterrupt:
         print("\nAborted by user during input.")
         return 1

@@ -1180,22 +1180,22 @@ def configure_render_services(
         if env == "local":
             continue
         service_name = f"{internal_name}-{env}-api"
-        payload = {
+        service_details: Dict[str, Any] = {
+            "env": "node",
+            "buildCommand": build_command,
+            "startCommand": start_command,
+            "buildPlan": RENDER_DEFAULT_PLAN,
+        }
+        payload: Dict[str, Any] = {
             "name": service_name,
             "type": "web_service",
-            "plan": RENDER_DEFAULT_PLAN,
-            "env": "node",
             "repo": repo_url,
             "branch": branch,
             "rootDir": root_dir,
-            "buildCommand": build_command,
-            "startCommand": start_command,
-            "autoDeploy": True,
-            "serviceDetails": {
-                "env": "node",
-            },
+            "autoDeploy": "yes",
+            "serviceDetails": service_details,
             "envVars": [
-                {"key": "NODE_ENV", "value": env if env != "prod" else "production"},
+                {"key": "NODE_ENV", "value": "production" if env == "prod" else env},
             ],
         }
         print(f"\nCreating Render service '{service_name}'...")

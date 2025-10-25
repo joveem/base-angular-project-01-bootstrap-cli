@@ -242,6 +242,7 @@ class ExecutionContext:
     godaddy_api_key: Optional[str] = field(default_factory=lambda: os.environ.get("GODADDY_API_KEY"))
     godaddy_api_secret: Optional[str] = field(default_factory=lambda: os.environ.get("GODADDY_API_SECRET"))
     domain_configured: bool = False
+    render_owner_id: Optional[str] = None
     frontend_root: Optional[Path] = None
 
     def _require_active_step(self) -> str:
@@ -1164,6 +1165,31 @@ def render_api_request(method: str, path: str, api_key: str, payload: Optional[d
         return exc.code, body
 
 
+def fetch_render_owner_id(api_key: str, ctx: Optional[ExecutionContext] = None) -> Optional[str]:
+    status, body = render_api_request("GET", "/v1/owners", api_key)
+    if status != 200:
+        message = f"Render API responded with {status}: {body}"
+        raise BootstrapError(f"Failed to resolve Render owner id. {message}")
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise BootstrapError(f"Render owner list response was not valid JSON: {exc}") from exc
+    owners = data.get("owners") if isinstance(data, dict) else data
+    if isinstance(owners, list) and owners:
+        owner = owners[0]
+        owner_id = owner.get("id") if isinstance(owner, dict) else None
+    elif isinstance(data, list) and data:
+        owner = data[0]
+        owner_id = owner.get("id") if isinstance(owner, dict) else None
+    else:
+        owner_id = None
+    if not owner_id:
+        raise BootstrapError("Unable to determine Render owner id from API response.")
+    if ctx is not None:
+        ctx.render_owner_id = owner_id
+    return owner_id
+
+
 def configure_render_services(
     internal_name: str,
     environments: Sequence[str],
@@ -1176,6 +1202,16 @@ def configure_render_services(
     ctx: Optional[ExecutionContext] = None,
 ) -> List[str]:
     created_services: List[str] = []
+    owner_id: Optional[str] = None
+    if ctx and ctx.render_owner_id:
+        owner_id = ctx.render_owner_id
+    else:
+        try:
+            owner_id = fetch_render_owner_id(api_key, ctx)
+        except BootstrapError as exc:
+            if ctx:
+                ctx.add_step_data("render_owner_error", str(exc))
+            raise
     for env in environments:
         if env == "local":
             continue
@@ -1194,6 +1230,7 @@ def configure_render_services(
             "rootDir": root_dir,
             "autoDeploy": "yes",
             "serviceDetails": service_details,
+            "ownerId": owner_id,
             "envVars": [
                 {"key": "NODE_ENV", "value": "production" if env == "prod" else env},
             ],

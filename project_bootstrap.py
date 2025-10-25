@@ -649,6 +649,11 @@ class PromptManager:
             record.summary_lines = 0
             record.summary_text = None
 
+    def clear_summary(self, prompt_id: str) -> None:
+        record = self.records.get(prompt_id)
+        if record:
+            self._clear_summary(record)
+
     def _clear_prompt_lines(self, count: int) -> None:
         if count <= 0:
             return
@@ -1368,6 +1373,7 @@ class Questionnaire:
         self.stack: Optional[StackOption] = None
         self.repo_parent: Path = Path(args.output_dir).expanduser().resolve()
         self.default_owner: str = detect_default_git_owner()
+        self.pending_internal_confirm: Optional[str] = None
 
     def run(self) -> UserConfig:
         steps: List[str] = [
@@ -1463,21 +1469,38 @@ class Questionnaire:
         return self.prompt_manager.prompt_choice("stack", "Select the stack configuration:", options, default_option=default)
 
     def _ask_internal_name(self) -> PromptOutcome:
-        previous = self.answers.get("app_internal_name")
+        while True:
+            default_value = self.answers.get("app_internal_name") or self.pending_internal_confirm
 
-        def validator(raw: str) -> Tuple[bool, Any, Optional[str]]:
-            return (True, raw, None) if raw else (False, None, "Value cannot be empty. Try again.")
+            def validator(raw: str) -> Tuple[bool, Any, Optional[str]]:
+                return (True, raw, None) if raw else (False, None, "Value cannot be empty. Try again.")
 
-        outcome = self.prompt_manager.prompt_text(
-            "app_internal_name",
-            "Internal app name (e.g., app-internal-name-01):",
-            default=previous,
-            allow_empty=False,
-            validator=validator,
-        )
-        if outcome.action in {"next", "redo"} and outcome.value:
-            self.answers["app_internal_name"] = outcome.value
-        return outcome
+            outcome = self.prompt_manager.prompt_text(
+                "app_internal_name",
+                "Internal app name (e.g., app-internal-name-01):",
+                default=default_value,
+                allow_empty=False,
+                validator=validator,
+            )
+            if outcome.action == "undo":
+                self.pending_internal_confirm = None
+                return outcome
+            if outcome.action not in {"next", "redo"} or not outcome.value:
+                return outcome
+
+            value = outcome.value
+            project_dir = self.repo_parent / value
+            if project_dir.exists() and self.pending_internal_confirm != value:
+                self.prompt_manager.clear_summary("app_internal_name")
+                self.prompt_manager._note(
+                    f"Directory {project_dir} already exists. Enter the same name again to confirm or choose a different name."
+                )
+                self.pending_internal_confirm = value
+                continue
+
+            self.pending_internal_confirm = None
+            self.answers["app_internal_name"] = value
+            return outcome
 
     def _ask_public_name(self) -> PromptOutcome:
         previous = self.answers.get("app_public_name")

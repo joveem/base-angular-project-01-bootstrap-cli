@@ -385,6 +385,10 @@ def _enable_ansi_sequences() -> bool:
 
 
 class PromptManager:
+    YELLOW = "\033[33m"
+    WHITE = "\033[37m"
+    RESET = "\033[0m"
+
     def __init__(self) -> None:
         self.history: List[PromptRecord] = []
         self.records: Dict[str, PromptRecord] = {}
@@ -597,12 +601,11 @@ class PromptManager:
         allow_redo: bool,
         extra_lines: List[str],
     ) -> int:
-        clean_request = request.strip()
-        if default:
-            clean_request = f"{clean_request} (default: {default})"
-
-        lines = [clean_request]
-        lines.extend(extra_lines)
+        request_line = self._format_request_line(request, default)
+        lines = [request_line]
+        if extra_lines:
+            formatted_extras = [self._apply_color(line, self.YELLOW) for line in extra_lines] if self.ansi_supported else extra_lines
+            lines.extend(formatted_extras)
 
         commands: List[str] = []
         if allow_undo:
@@ -610,7 +613,8 @@ class PromptManager:
         if allow_redo:
             commands.append("--redo to keep the previous value")
         if commands:
-            lines.append("Commands: " + "; ".join(commands))
+            command_line = "Commands: " + "; ".join(commands)
+            lines.append(self._apply_color(command_line, self.YELLOW) if self.ansi_supported else command_line)
 
         output = "\n".join(lines)
         print(output)
@@ -627,7 +631,17 @@ class PromptManager:
         summary_value = summary_formatter(value) if summary_formatter else str(value)
         compact_request = " ".join(request.replace("\n", " ").split())
         default_display = default if default is not None else ""
-        return f"{compact_request} [{default_display}] -> {summary_value}"
+        if not self.ansi_supported:
+            return f"{compact_request} [{default_display}] -> {summary_value}"
+
+        request_colored = self._apply_color(compact_request, self.YELLOW)
+        if default is None:
+            default_section = ""
+        else:
+            default_section = f" {self._apply_color('[', self.YELLOW)}{self._apply_color(default_display, self.WHITE)}{self._apply_color(']', self.YELLOW)}"
+        arrow = f" {self._apply_color('->', self.YELLOW)} "
+        value_colored = self._apply_color(summary_value, self.WHITE)
+        return f"{request_colored}{default_section}{arrow}{value_colored}"
 
     def _print_summary(
         self,
@@ -640,8 +654,9 @@ class PromptManager:
             return 0
         summary = self._format_summary_text(request, default, record.value, summary_formatter)
         record.summary_text = summary
+        print()
         print(summary)
-        return summary.count("\n") + 1
+        return summary.count("\n") + 2
 
     def _clear_summary(self, record: PromptRecord) -> None:
         if record.summary_lines > 0:
@@ -668,6 +683,25 @@ class PromptManager:
 
     def _note(self, message: str) -> None:
         print(message)
+
+    def _apply_color(self, text: str, color: str) -> str:
+        if not self.ansi_supported or not text:
+            return text
+        return f"{color}{text}{self.RESET}"
+
+    def _format_request_line(self, request: str, default: Optional[str]) -> str:
+        clean_request = request.strip()
+        if default is None:
+            return self._apply_color(clean_request, self.YELLOW)
+
+        if not self.ansi_supported:
+            return f"{clean_request} (default: {default})"
+
+        request_colored = self._apply_color(clean_request, self.YELLOW)
+        prefix = self._apply_color(" (", self.YELLOW) + self._apply_color("default: ", self.YELLOW)
+        default_colored = self._apply_color(default, self.WHITE)
+        suffix = self._apply_color(")", self.YELLOW)
+        return f"{request_colored}{prefix}{default_colored}{suffix}"
 
 REQUIRED_COMMANDS_BASE: Dict[str, Tuple[str, str]] = {
     "git": ("Install Git", "https://git-scm.com/downloads"),

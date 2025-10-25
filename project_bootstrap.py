@@ -1209,9 +1209,15 @@ def configure_render_services(
         try:
             owner_id = fetch_render_owner_id(api_key, ctx)
         except BootstrapError as exc:
+            message = str(exc)
+            print(f"  Unable to determine Render owner id automatically: {message}")
+            print("  Skipping Render automation for this run.")
+            log_remaining(
+                "Create Render.com services manually (API owner lookup failed or account does not support creation)."
+            )
             if ctx:
-                ctx.add_step_data("render_owner_error", str(exc))
-            raise
+                ctx.add_step_data("render_owner_error", message)
+            return created_services
     for env in environments:
         if env == "local":
             continue
@@ -1239,6 +1245,13 @@ def configure_render_services(
         status, body = render_api_request("POST", "/v1/services", api_key, payload)
         if status not in (200, 201):
             lower_body = body.lower()
+            if "free-tier" in lower_body or "free tier" in lower_body:
+                print("  Render API reports that free-tier accounts cannot create services via API.")
+                print("  Skipping Render automation for remaining environments.")
+                log_remaining(
+                    "Create Render.com services manually (account restricted from API service creation)."
+                )
+                return created_services
             if status == 409 or "already exists" in lower_body:
                 print(f"  Render service '{service_name}' already exists; skipping.")
                 continue

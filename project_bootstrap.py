@@ -701,6 +701,12 @@ def run_command(command: Sequence[str], cwd: Optional[Path] = None, check: bool 
     return result
 
 
+def is_command_missing_error(error: BootstrapError, command: str) -> bool:
+    message = str(error)
+    token = f"Failed to execute command '{command}"
+    return message.startswith("90-02") and token in message
+
+
 def ensure_command_available(command: str) -> bool:
     return shutil.which(command) is not None
 
@@ -784,19 +790,34 @@ def replace_placeholders(
     return changed
 
 
-def create_firebase_project(project_id: str, display_name: str) -> None:
+def create_firebase_project(project_id: str, display_name: str) -> bool:
     print(f"\nCreating Firebase project '{project_id}'...")
-    run_command(
-        ["firebase", "projects:create", project_id, "--display-name", display_name, "--quiet"],
-    )
+    try:
+        run_command(
+            ["firebase", "projects:create", project_id, "--display-name", display_name, "--quiet"],
+        )
+        return True
+    except BootstrapError as exc:
+        if is_command_missing_error(exc, "firebase"):
+            print("  Firebase CLI not available; skipping project creation.")
+            log_remaining("Create Firebase project via Firebase CLI (command unavailable).")
+            return False
+        raise
 
 
 def enable_firestore(project_id: str) -> bool:
     print(f"\nEnabling Firestore for '{project_id}' (if not already enabled)...")
-    result = run_command(
-        ["firebase", "firestore:databases:create", "--project", project_id, "(default)"],
-        check=False,
-    )
+    try:
+        result = run_command(
+            ["firebase", "firestore:databases:create", "--project", project_id, "(default)"],
+            check=False,
+        )
+    except BootstrapError as exc:
+        if is_command_missing_error(exc, "firebase"):
+            print("  Firebase CLI not available; skipping Firestore enablement.")
+            log_remaining("Enable Firestore database via Firebase CLI (command unavailable).")
+            return False
+        raise
     if result.returncode != 0:
         combined = (result.stderr or result.stdout or "").lower()
         if "already exists" in combined:
@@ -814,10 +835,17 @@ def create_firebase_hosting_sites(project_id: str, environments: Sequence[str]) 
             continue
         site_id = f"{project_id}-{env}"
         print(f"\nCreating Firebase Hosting site '{site_id}'...")
-        result = run_command(
-            ["firebase", "hosting:sites:create", site_id, "--project", project_id],
-            check=False,
-        )
+        try:
+            result = run_command(
+                ["firebase", "hosting:sites:create", site_id, "--project", project_id],
+                check=False,
+            )
+        except BootstrapError as exc:
+            if is_command_missing_error(exc, "firebase"):
+                print("  Firebase CLI not available; skipping Firebase Hosting site creation.")
+                log_remaining("Create Firebase Hosting sites via Firebase CLI (command unavailable).")
+                return env_sites, created_sites
+            raise
         if result.returncode != 0:
             combined = (result.stderr or result.stdout or "").lower()
             if "already exists" in combined:
@@ -1772,8 +1800,8 @@ def rollback_remove_generated_paths(ctx: ExecutionContext) -> None:
 
 
 def step_create_firebase_project(ctx: ExecutionContext) -> None:
-    create_firebase_project(ctx.config.firebase_project_id, ctx.config.app_public_name)
-    ctx.add_step_data("project_created", True)
+    created = create_firebase_project(ctx.config.firebase_project_id, ctx.config.app_public_name)
+    ctx.add_step_data("project_created", created)
 
 
 def rollback_delete_firebase_project(ctx: ExecutionContext) -> None:

@@ -21,7 +21,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -348,6 +347,322 @@ class StepExecutor:
                 ctx.active_step = None
         return results
 
+
+@dataclass
+class PromptOutcome:
+    action: str
+    value: Any = None
+
+
+@dataclass
+class PromptRecord:
+    prompt_id: str
+    request: str
+    default: Optional[str] = None
+    value: Any = None
+    summary_text: Optional[str] = None
+    summary_lines: int = 0
+    prompt_lines: int = 0
+    redo_pending: bool = False
+
+
+def _enable_ansi_sequences() -> bool:
+    if os.name != "nt":
+        return True
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+        mode = ctypes.c_ulong()
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return False
+        if not kernel32.SetConsoleMode(handle, mode.value | 0x0004):
+            return False
+        return True
+    except Exception:
+        return False
+
+
+class PromptManager:
+    def __init__(self) -> None:
+        self.history: List[PromptRecord] = []
+        self.records: Dict[str, PromptRecord] = {}
+        self.cursor: int = 0
+        self.ansi_supported: bool = _enable_ansi_sequences()
+
+    def reset(self) -> None:
+        self.history.clear()
+        self.records.clear()
+        self.cursor = 0
+
+    def remove_record(self, prompt_id: str) -> None:
+        record = self.records.pop(prompt_id, None)
+        if not record:
+            return
+        try:
+            idx = self.history.index(record)
+        except ValueError:
+            return
+        self._clear_summary(record)
+        self.history.pop(idx)
+        if self.cursor > idx:
+            self.cursor = max(self.cursor - 1, 0)
+
+    def prompt_text(
+        self,
+        prompt_id: str,
+        request: str,
+        default: Optional[str] = None,
+        allow_empty: bool = False,
+        validator: Optional[Callable[[str], Tuple[bool, Any, Optional[str]]]] = None,
+        summary_formatter: Optional[Callable[[Any], str]] = None,
+        extra_lines: Optional[Iterable[str]] = None,
+    ) -> PromptOutcome:
+        return self._prompt(
+            prompt_id,
+            request,
+            default,
+            allow_empty=allow_empty,
+            validator=validator,
+            summary_formatter=summary_formatter,
+            extra_lines=list(extra_lines) if extra_lines else [],
+        )
+
+    def prompt_yes_no(
+        self,
+        prompt_id: str,
+        request: str,
+        default: bool = True,
+    ) -> PromptOutcome:
+        default_text = "y" if default else "n"
+
+        def validator(raw: str) -> Tuple[bool, Any, Optional[str]]:
+            lowered = raw.lower()
+            if lowered in {"y", "yes"}:
+                return True, True, None
+            if lowered in {"n", "no"}:
+                return True, False, None
+            return False, None, "Please answer with 'y' or 'n'."
+
+        def formatter(value: Any) -> str:
+            return "yes" if value else "no"
+
+        return self._prompt(
+            prompt_id,
+            request,
+            default_text,
+            allow_empty=True,
+            validator=validator,
+            summary_formatter=formatter,
+        )
+
+    def prompt_choice(
+        self,
+        prompt_id: str,
+        request: str,
+        options: Sequence[Tuple[str, str, Any]],
+        default_option: Optional[str] = None,
+    ) -> PromptOutcome:
+        options_lines = [f" {key:>2}) {label}" for key, label, _ in options]
+
+        value_by_key = {key: value for key, _, value in options}
+
+        def validator(raw: str) -> Tuple[bool, Any, Optional[str]]:
+            if raw in value_by_key:
+                return True, value_by_key[raw], None
+            return False, None, "Please choose one of the listed options."
+
+        def formatter(value: Any) -> str:
+            for key, label, candidate in options:
+                if candidate == value:
+                    return f"{label} (#{key})"
+            return str(value)
+
+        return self._prompt(
+            prompt_id,
+            request,
+            default_option,
+            allow_empty=False,
+            validator=validator,
+            summary_formatter=formatter,
+            extra_lines=options_lines,
+        )
+
+    def _prompt(
+        self,
+        prompt_id: str,
+        request: str,
+        default: Optional[str],
+        *,
+        allow_empty: bool,
+        validator: Optional[Callable[[str], Tuple[bool, Any, Optional[str]]]],
+        summary_formatter: Optional[Callable[[Any], str]],
+        extra_lines: Optional[List[str]],
+    ) -> PromptOutcome:
+        record, idx = self._ensure_record(prompt_id, request, default)
+
+        while True:
+            allow_undo = idx > 0
+            allow_redo = record.redo_pending and record.value is not None
+
+            prompt_lines = self._print_prompt(record, request, default, allow_undo, allow_redo, extra_lines or [])
+            try:
+                user_input = input("> ").strip()
+            except EOFError:
+                user_input = ""
+            self._clear_prompt_lines(prompt_lines + 1)
+
+            command = user_input.lower()
+            if command == "--undo":
+                if not allow_undo:
+                    self._note("Already at the first step; cannot undo.")
+                    continue
+                self._handle_undo(idx, record)
+                return PromptOutcome(action="undo")
+
+            if command == "--redo":
+                if allow_redo:
+                    record.redo_pending = False
+                    self.cursor = idx + 1
+                    self._print_summary(record, request, default, summary_formatter)
+                    return PromptOutcome(action="redo", value=record.value)
+                self._note("Nothing to redo for this step.")
+                continue
+
+            if not user_input and default is not None:
+                user_input = default
+
+            if not user_input and not allow_empty:
+                self._note("Value cannot be empty. Try again.")
+                continue
+
+            if validator:
+                ok, normalized, error = validator(user_input)
+                if not ok:
+                    self._note(error or "Invalid value. Try again.")
+                    continue
+                value = normalized
+            else:
+                value = user_input
+
+            record.value = value
+            record.default = default
+            record.redo_pending = False
+            self.cursor = idx + 1
+            record.summary_lines = self._print_summary(record, request, default, summary_formatter)
+            return PromptOutcome(action="next", value=value)
+
+    def _ensure_record(self, prompt_id: str, request: str, default: Optional[str]) -> Tuple[PromptRecord, int]:
+        record = self.records.get(prompt_id)
+        if record is None:
+            record = PromptRecord(prompt_id=prompt_id, request=request, default=default)
+            self.records[prompt_id] = record
+            self.history.insert(self.cursor, record)
+        else:
+            record.request = request
+            record.default = default
+
+        try:
+            idx = self.history.index(record)
+        except ValueError:
+            self.history.insert(self.cursor, record)
+            idx = self.cursor
+        self.cursor = idx
+        return record, idx
+
+    def _handle_undo(self, idx: int, record: PromptRecord) -> None:
+        is_new_without_value = record.value is None
+        if is_new_without_value:
+            self.remove_record(record.prompt_id)
+        else:
+            record.redo_pending = True
+            self._clear_summary(record)
+
+        prev_idx = max(idx - 1, 0)
+        if prev_idx < len(self.history):
+            prev_record = self.history[prev_idx]
+            self._clear_summary(prev_record)
+            if prev_record.value is not None:
+                prev_record.redo_pending = True
+        self.cursor = prev_idx
+
+    def _print_prompt(
+        self,
+        record: PromptRecord,
+        request: str,
+        default: Optional[str],
+        allow_undo: bool,
+        allow_redo: bool,
+        extra_lines: List[str],
+    ) -> int:
+        clean_request = request.strip()
+        if default:
+            clean_request = f"{clean_request} (default: {default})"
+
+        lines = [clean_request]
+        lines.extend(extra_lines)
+
+        commands: List[str] = []
+        if allow_undo:
+            commands.append("--undo to revisit the previous step")
+        if allow_redo:
+            commands.append("--redo to keep the previous value")
+        if commands:
+            lines.append("Commands: " + "; ".join(commands))
+
+        output = "\n".join(lines)
+        print(output)
+        record.prompt_lines = len(lines)
+        return len(lines)
+
+    def _format_summary_text(
+        self,
+        request: str,
+        default: Optional[str],
+        value: Any,
+        summary_formatter: Optional[Callable[[Any], str]],
+    ) -> str:
+        summary_value = summary_formatter(value) if summary_formatter else str(value)
+        compact_request = " ".join(request.replace("\n", " ").split())
+        default_display = default if default is not None else ""
+        return f"{compact_request} [{default_display}] -> {summary_value}"
+
+    def _print_summary(
+        self,
+        record: PromptRecord,
+        request: str,
+        default: Optional[str],
+        summary_formatter: Optional[Callable[[Any], str]],
+    ) -> int:
+        if record.value is None:
+            return 0
+        summary = self._format_summary_text(request, default, record.value, summary_formatter)
+        record.summary_text = summary
+        print(summary)
+        return summary.count("\n") + 1
+
+    def _clear_summary(self, record: PromptRecord) -> None:
+        if record.summary_lines > 0:
+            self._clear_lines(record.summary_lines)
+            record.summary_lines = 0
+            record.summary_text = None
+
+    def _clear_prompt_lines(self, count: int) -> None:
+        if count <= 0:
+            return
+        self._clear_lines(count)
+
+    def _clear_lines(self, count: int) -> None:
+        if not self.ansi_supported:
+            return
+        for _ in range(count):
+            sys.stdout.write("\033[F\033[K")
+        sys.stdout.flush()
+
+    def _note(self, message: str) -> None:
+        print(message)
+
 REQUIRED_COMMANDS_BASE: Dict[str, Tuple[str, str]] = {
     "git": ("Install Git", "https://git-scm.com/downloads"),
     "node": ("Install Node.js (>=18.x)", "https://nodejs.org/en/download/"),
@@ -417,36 +732,6 @@ def validate_prerequisites(features: Set[str]) -> bool:
         print("\nYou can rerun this CLI after installing the missing tools.")
         return False
     return True
-
-
-def prompt_stack_choice() -> StackOption:
-    print("Select the stack configuration:\n")
-    for idx, option in enumerate(STACK_OPTIONS, start=1):
-        print(f" {idx:2d}) {option.label}")
-    print()
-
-    while True:
-        choice = input("Enter option number: ").strip()
-        if not choice.isdigit():
-            print("Please enter a numeric choice.")
-            continue
-        idx = int(choice)
-        if 1 <= idx <= len(STACK_OPTIONS):
-            return STACK_OPTIONS[idx - 1]
-        print("Choice out of range. Try again.")
-
-
-def prompt_non_empty(prompt: str, default: Optional[str] = None) -> str:
-    while True:
-        suffix = f" [{default}]" if default else ""
-        base_prompt = prompt.rstrip()
-        prompt_text = f"{base_prompt}{suffix}"
-        value = input(f"{prompt_text} ").strip()
-        if default and not value:
-            return default
-        if value:
-            return value
-        print("Value cannot be empty. Try again.")
 
 
 def prompt_yes_no(question: str, default: bool = True) -> bool:
@@ -915,65 +1200,8 @@ def summarise_dns_instructions(app_public_name: str, internal_name: str) -> None
 
 
 def collect_user_config(args: argparse.Namespace) -> UserConfig:
-    stack = prompt_stack_choice()
-    features_display = ", ".join(sorted(stack.features)) or "angular + tailwindcss"
-    print(f"\nSelected stack: {stack.label}\nFeatures: {features_display}\n")
-
-    app_internal_name = prompt_non_empty("Internal app name (e.g., app-internal-name-01): ")
-    app_public_name = prompt_non_empty("Public app name (e.g., App Public Name): ")
-    repo_parent = Path(args.output_dir).expanduser().resolve()
-    project_dir = repo_parent / app_internal_name
-
-    should_clone = prompt_yes_no(f"\nClone template repository into {project_dir}?")
-
-    firebase_default = app_internal_name
-    firebase_project_id = prompt_non_empty("\nFirebase project id (e.g., app-internal-name-01):", firebase_default)
-
-    node_api_config: Optional[NodeAPIConfig] = None
-    if "node_api" in stack.features:
-        print("\nNode API configuration for Render.com deployments:")
-        api_repo_default = generate_default_api_repo(app_internal_name)
-        branch_default = "main-01"
-        service_repo = prompt_non_empty(
-            "  Repository URL (e.g., https://github.com/user/app-api.git):", api_repo_default
-        )
-        service_branch = prompt_non_empty("  Default branch (e.g., main):", branch_default)
-        service_root = input("  Root directory for API project (default '.'): ").strip() or "."
-        build_command = input("  Render build command (default: npm install && npm run build): ").strip() or "npm install && npm run build"
-        start_command = input("  Render start command (default: npm run start): ").strip() or "npm run start"
-        node_api_config = NodeAPIConfig(
-            repo_url=service_repo,
-            branch=service_branch,
-            root_dir=service_root,
-            build_command=build_command,
-            start_command=start_command,
-        )
-
-    frontend_subdir = input("\nAngular project root relative to repository (default '.'): ").strip() or "."
-
-    configure_dns = False
-    domain_name: Optional[str] = None
-    if not args.dry_run:
-        configure_dns = prompt_yes_no("\nConfigure GoDaddy DNS automatically after hosting setup?", default=False)
-        if configure_dns:
-            domain_default = generate_default_domain(app_internal_name)
-            domain_name = prompt_non_empty("Enter purchased domain (e.g., apppublicname.com):", domain_default)
-
-    return UserConfig(
-        stack=stack,
-        app_internal_name=app_internal_name,
-        app_public_name=app_public_name,
-        repo_parent=repo_parent,
-        project_dir=project_dir,
-        should_clone=should_clone,
-        firebase_project_id=firebase_project_id,
-        template_url=args.template_url,
-        dry_run=args.dry_run,
-        node_api=node_api_config,
-        configure_dns=configure_dns,
-        domain_name=domain_name,
-        frontend_subdir=frontend_subdir,
-    )
+    questionnaire = Questionnaire(args)
+    return questionnaire.run()
 
 
 def build_replacements(config: UserConfig) -> Dict[str, str]:
@@ -1093,6 +1321,316 @@ def generate_default_api_repo(internal_name: str, owner: Optional[str] = None) -
     else:
         repo_name_with_suffix = repo_name
     return f"git@github.com:{repo_owner}/{repo_name_with_suffix}"
+
+
+class Questionnaire:
+    NODE_STEPS: Tuple[str, ...] = (
+        "node_repo",
+        "node_branch",
+        "node_root",
+        "node_build",
+        "node_start",
+    )
+
+    def __init__(self, args: argparse.Namespace) -> None:
+        self.args = args
+        self.prompt_manager = PromptManager()
+        self.answers: Dict[str, Any] = {}
+        self.stack: Optional[StackOption] = None
+        self.repo_parent: Path = Path(args.output_dir).expanduser().resolve()
+        self.default_owner: str = detect_default_git_owner()
+
+    def run(self) -> UserConfig:
+        steps: List[str] = [
+            "stack",
+            "app_internal_name",
+            "app_public_name",
+            "should_clone",
+            "firebase_project",
+            *self.NODE_STEPS,
+            "frontend_subdir",
+            "configure_dns",
+            "domain_name",
+        ]
+
+        idx = 0
+        while idx < len(steps):
+            step_id = steps[idx]
+            if not self._is_applicable(step_id):
+                self.prompt_manager.remove_record(step_id)
+                idx += 1
+                continue
+
+            outcome = self._dispatch(step_id)
+            if outcome.action == "undo":
+                if idx > 0:
+                    idx -= 1
+                continue
+            if outcome.action in {"next", "redo"}:
+                if outcome.value is not None:
+                    self.answers[step_id] = outcome.value
+                    if step_id == "stack":
+                        self.stack = outcome.value
+                idx += 1
+                continue
+            idx += 1
+
+        return self._build_config()
+
+    def _is_applicable(self, step_id: str) -> bool:
+        features = self.stack.features if self.stack else set()
+        if step_id in self.NODE_STEPS and "node_api" not in features:
+            self.answers.pop(step_id, None)
+            return False
+        if step_id in {"configure_dns", "domain_name"} and self.args.dry_run:
+            if step_id == "configure_dns":
+                self.answers.pop("configure_dns", None)
+            if step_id == "domain_name":
+                self.answers.pop("domain_name", None)
+            return False
+        if step_id == "domain_name" and not self.answers.get("configure_dns"):
+            self.answers.pop("domain_name", None)
+            return False
+        return True
+
+    def _dispatch(self, step_id: str) -> PromptOutcome:
+        if step_id == "stack":
+            return self._ask_stack()
+        if step_id == "app_internal_name":
+            return self._ask_internal_name()
+        if step_id == "app_public_name":
+            return self._ask_public_name()
+        if step_id == "should_clone":
+            return self._ask_should_clone()
+        if step_id == "firebase_project":
+            return self._ask_firebase_project()
+        if step_id == "node_repo":
+            return self._ask_node_repo()
+        if step_id == "node_branch":
+            return self._ask_node_branch()
+        if step_id == "node_root":
+            return self._ask_node_root()
+        if step_id == "node_build":
+            return self._ask_node_build()
+        if step_id == "node_start":
+            return self._ask_node_start()
+        if step_id == "frontend_subdir":
+            return self._ask_frontend_subdir()
+        if step_id == "configure_dns":
+            return self._ask_configure_dns()
+        if step_id == "domain_name":
+            return self._ask_domain_name()
+        return PromptOutcome(action="next", value=None)
+
+    def _ask_stack(self) -> PromptOutcome:
+        options = [(str(idx), option.label, option) for idx, option in enumerate(STACK_OPTIONS, start=1)]
+        current = self.answers.get("stack")
+        default = None
+        if current:
+            for key, _, option in options:
+                if option == current:
+                    default = key
+                    break
+        return self.prompt_manager.prompt_choice("stack", "Select the stack configuration:", options, default_option=default)
+
+    def _ask_internal_name(self) -> PromptOutcome:
+        previous = self.answers.get("app_internal_name")
+
+        def validator(raw: str) -> Tuple[bool, Any, Optional[str]]:
+            return (True, raw, None) if raw else (False, None, "Value cannot be empty. Try again.")
+
+        outcome = self.prompt_manager.prompt_text(
+            "app_internal_name",
+            "Internal app name (e.g., app-internal-name-01):",
+            default=previous,
+            allow_empty=False,
+            validator=validator,
+        )
+        if outcome.action in {"next", "redo"} and outcome.value:
+            self.answers["app_internal_name"] = outcome.value
+        return outcome
+
+    def _ask_public_name(self) -> PromptOutcome:
+        previous = self.answers.get("app_public_name")
+
+        def validator(raw: str) -> Tuple[bool, Any, Optional[str]]:
+            return (True, raw, None) if raw else (False, None, "Value cannot be empty. Try again.")
+
+        return self.prompt_manager.prompt_text(
+            "app_public_name",
+            "Public app name (e.g., App Public Name):",
+            default=previous,
+            allow_empty=False,
+            validator=validator,
+        )
+
+    def _ask_should_clone(self) -> PromptOutcome:
+        internal_name = self.answers.get("app_internal_name", "<app>")
+        project_dir = self.repo_parent / internal_name
+        previous = self.answers.get("should_clone")
+        default = previous if previous is not None else True
+        request = f"Clone template repository into {project_dir}?"
+        return self.prompt_manager.prompt_yes_no("should_clone", request, default=default)
+
+    def _ask_firebase_project(self) -> PromptOutcome:
+        internal_name = self.answers.get("app_internal_name", "")
+        previous = self.answers.get("firebase_project")
+        default = previous or internal_name or None
+
+        def validator(raw: str) -> Tuple[bool, Any, Optional[str]]:
+            return (True, raw, None) if raw else (False, None, "Value cannot be empty. Try again.")
+
+        return self.prompt_manager.prompt_text(
+            "firebase_project",
+            "\nFirebase project id (e.g., app-internal-name-01):",
+            default=default,
+            allow_empty=False,
+            validator=validator,
+        )
+
+    def _ask_node_repo(self) -> PromptOutcome:
+        internal_name = self.answers.get("app_internal_name", "")
+        previous = self.answers.get("node_repo")
+        auto_default = generate_default_api_repo(internal_name, owner=self.default_owner) if internal_name else None
+        default = previous or auto_default
+
+        def validator(raw: str) -> Tuple[bool, Any, Optional[str]]:
+            return (True, raw, None) if raw else (False, None, "Value cannot be empty. Try again.")
+
+        return self.prompt_manager.prompt_text(
+            "node_repo",
+            "  Node API repository URL (e.g., https://github.com/user/app-api.git):",
+            default=default,
+            allow_empty=False,
+            validator=validator,
+        )
+
+    def _ask_node_branch(self) -> PromptOutcome:
+        previous = self.answers.get("node_branch")
+        default = previous or "main-01"
+
+        def validator(raw: str) -> Tuple[bool, Any, Optional[str]]:
+            return (True, raw, None) if raw else (False, None, "Value cannot be empty. Try again.")
+
+        return self.prompt_manager.prompt_text(
+            "node_branch",
+            "  Default branch for Render deployments (e.g., main):",
+            default=default,
+            allow_empty=False,
+            validator=validator,
+        )
+
+    def _ask_node_root(self) -> PromptOutcome:
+        previous = self.answers.get("node_root")
+        default = previous or "."
+        return self.prompt_manager.prompt_text(
+            "node_root",
+            "  Root directory for API project (default '.'):",
+            default=default,
+            allow_empty=True,
+            validator=lambda raw: (True, raw or default, None),
+        )
+
+    def _ask_node_build(self) -> PromptOutcome:
+        previous = self.answers.get("node_build")
+        default = previous or "npm install && npm run build"
+        return self.prompt_manager.prompt_text(
+            "node_build",
+            "  Render build command (default: npm install && npm run build):",
+            default=default,
+            allow_empty=True,
+            validator=lambda raw: (True, raw or default, None),
+        )
+
+    def _ask_node_start(self) -> PromptOutcome:
+        previous = self.answers.get("node_start")
+        default = previous or "npm run start"
+        return self.prompt_manager.prompt_text(
+            "node_start",
+            "  Render start command (default: npm run start):",
+            default=default,
+            allow_empty=True,
+            validator=lambda raw: (True, raw or default, None),
+        )
+
+    def _ask_frontend_subdir(self) -> PromptOutcome:
+        previous = self.answers.get("frontend_subdir")
+        default = previous or "."
+        return self.prompt_manager.prompt_text(
+            "frontend_subdir",
+            "\nAngular project root relative to repository (default '.'):",
+            default=default,
+            allow_empty=True,
+            validator=lambda raw: (True, raw or default, None),
+        )
+
+    def _ask_configure_dns(self) -> PromptOutcome:
+        previous = self.answers.get("configure_dns")
+        default = previous if previous is not None else False
+        return self.prompt_manager.prompt_yes_no(
+            "configure_dns",
+            "\nConfigure GoDaddy DNS automatically after hosting setup?",
+            default=default,
+        )
+
+    def _ask_domain_name(self) -> PromptOutcome:
+        internal_name = self.answers.get("app_internal_name", "")
+        previous = self.answers.get("domain_name")
+        auto_default = generate_default_domain(internal_name) if internal_name else None
+        default = previous or auto_default
+
+        def validator(raw: str) -> Tuple[bool, Any, Optional[str]]:
+            return (True, raw, None) if raw else (False, None, "Value cannot be empty. Try again.")
+
+        return self.prompt_manager.prompt_text(
+            "domain_name",
+            "Enter purchased domain (e.g., apppublicname.com):",
+            default=default,
+            allow_empty=False,
+            validator=validator,
+        )
+
+    def _build_config(self) -> UserConfig:
+        stack = self.answers.get("stack")
+        internal_name = self.answers.get("app_internal_name")
+        public_name = self.answers.get("app_public_name")
+        firebase_project = self.answers.get("firebase_project")
+        frontend_subdir = self.answers.get("frontend_subdir", ".")
+        configure_dns = bool(self.answers.get("configure_dns"))
+        domain_name = self.answers.get("domain_name") if configure_dns else None
+        should_clone = bool(self.answers.get("should_clone", True))
+
+        repo_parent = self.repo_parent
+        project_dir = repo_parent / internal_name
+
+        node_api_config: Optional[NodeAPIConfig] = None
+        if stack and "node_api" in stack.features:
+            node_api_config = NodeAPIConfig(
+                repo_url=self.answers.get("node_repo"),
+                branch=self.answers.get("node_branch"),
+                root_dir=self.answers.get("node_root") or ".",
+                build_command=self.answers.get("node_build") or "npm install && npm run build",
+                start_command=self.answers.get("node_start") or "npm run start",
+            )
+
+        if not stack or not internal_name or not public_name or not firebase_project:
+            raise BootstrapError("Questionnaire did not complete successfully. Please rerun the CLI.")
+
+        return UserConfig(
+            stack=stack,
+            app_internal_name=internal_name,
+            app_public_name=public_name,
+            repo_parent=repo_parent,
+            project_dir=project_dir,
+            should_clone=should_clone,
+            firebase_project_id=firebase_project,
+            template_url=self.args.template_url,
+            dry_run=self.args.dry_run,
+            node_api=node_api_config,
+            configure_dns=configure_dns,
+            domain_name=domain_name,
+            frontend_subdir=frontend_subdir,
+        )
 
 
 def delete_firebase_project(project_id: str) -> None:

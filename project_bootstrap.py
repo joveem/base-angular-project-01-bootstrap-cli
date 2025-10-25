@@ -511,12 +511,15 @@ class PromptManager:
             allow_undo = idx > 0
             allow_redo = record.redo_pending and record.value is not None
 
+            spacing_lines = self._print_prompt_spacing()
             prompt_lines = self._print_prompt(record, request, default, allow_undo, allow_redo, extra_lines or [])
+            total_prompt_lines = spacing_lines + prompt_lines
+            record.prompt_lines = total_prompt_lines
             try:
                 user_input = input("> ").strip()
             except EOFError:
                 user_input = ""
-            self._clear_prompt_lines(prompt_lines + 1)
+            self._clear_prompt_lines(total_prompt_lines + 1)
 
             command = user_input.lower()
             if command == "--undo":
@@ -604,7 +607,11 @@ class PromptManager:
         request_line = self._format_request_line(request, default)
         lines = [request_line]
         if extra_lines:
-            formatted_extras = [self._apply_color(line, self.YELLOW) for line in extra_lines] if self.ansi_supported else extra_lines
+            formatted_extras = (
+                [self._apply_color(line, self.YELLOW) for line in extra_lines]
+                if self.ansi_supported
+                else extra_lines
+            )
             lines.extend(formatted_extras)
 
         commands: List[str] = []
@@ -618,7 +625,6 @@ class PromptManager:
 
         output = "\n".join(lines)
         print(output)
-        record.prompt_lines = len(lines)
         return len(lines)
 
     def _format_summary_text(
@@ -635,10 +641,16 @@ class PromptManager:
             return f"{compact_request} [{default_display}] -> {summary_value}"
 
         request_colored = self._apply_color(compact_request, self.YELLOW)
+
         if default is None:
             default_section = ""
         else:
-            default_section = f" {self._apply_color('[', self.YELLOW)}{self._apply_color(default_display, self.WHITE)}{self._apply_color(']', self.YELLOW)}"
+            default_section = (
+                f" {self._apply_color('[', self.YELLOW)}"
+                f"{self._apply_color(default_display, self.WHITE)}"
+                f"{self._apply_color(']', self.YELLOW)}"
+            )
+
         arrow = f" {self._apply_color('->', self.YELLOW)} "
         value_colored = self._apply_color(summary_value, self.WHITE)
         return f"{request_colored}{default_section}{arrow}{value_colored}"
@@ -692,7 +704,7 @@ class PromptManager:
     def _format_request_line(self, request: str, default: Optional[str]) -> str:
         clean_request = request.strip()
         if default is None:
-            return self._apply_color(clean_request, self.YELLOW)
+            return self._apply_color(clean_request, self.YELLOW) if self.ansi_supported else clean_request
 
         if not self.ansi_supported:
             return f"{clean_request} (default: {default})"
@@ -702,6 +714,15 @@ class PromptManager:
         default_colored = self._apply_color(default, self.WHITE)
         suffix = self._apply_color(")", self.YELLOW)
         return f"{request_colored}{prefix}{default_colored}{suffix}"
+
+    def _print_prompt_spacing(self) -> int:
+        if not self.history:
+            return 0
+        if not any(rec.summary_lines > 0 for rec in self.history):
+            return 0
+        print()
+        print()
+        return 2
 
 REQUIRED_COMMANDS_BASE: Dict[str, Tuple[str, str]] = {
     "git": ("Install Git", "https://git-scm.com/downloads"),
@@ -1085,45 +1106,45 @@ def create_s3_buckets(internal_name: str, environments: Sequence[str], ctx: Opti
             }
             policy_path = tmpdir_path / f"{bucket_name}-policy.json"
             policy_path.write_text(json.dumps(policy, indent=2), encoding="utf-8")
-        print(f"  Applying public-read policy to {bucket_name}...")
-        run_command(
-            [
-                "aws",
-                "s3api",
-                "put-bucket-policy",
-                "--bucket",
-                bucket_name,
-                "--policy",
-                str(policy_path.resolve()),
-            ]
-        )
+            print(f"  Applying public-read policy to {bucket_name}...")
+            run_command(
+                [
+                    "aws",
+                    "s3api",
+                    "put-bucket-policy",
+                    "--bucket",
+                    bucket_name,
+                    "--policy",
+                    str(policy_path.resolve()),
+                ]
+            )
 
-        cors_rules = {
-            "CORSRules": [
-                {
-                    "AllowedHeaders": ["*"],
-                    "AllowedMethods": ["GET", "HEAD"],
+            cors_rules = {
+                "CORSRules": [
+                    {
+                        "AllowedHeaders": ["*"],
+                        "AllowedMethods": ["GET", "HEAD"],
                         "AllowedOrigins": ["*"],
                         "ExposeHeaders": ["ETag"],
-                    "MaxAgeSeconds": 3600,
-                }
-            ]
-        }
-        cors_path = tmpdir_path / f"{bucket_name}-cors.json"
-        cors_path.write_text(json.dumps(cors_rules, indent=2), encoding="utf-8")
-        print(f"  Applying permissive CORS to {bucket_name}...")
-        run_command(
-            [
-                "aws",
-                "s3api",
-                "put-bucket-cors",
-                "--bucket",
-                bucket_name,
-                "--cors-configuration",
-                str(cors_path.resolve()),
-            ]
-        )
-        created.append(bucket_name)
+                        "MaxAgeSeconds": 3600,
+                    }
+                ]
+            }
+            cors_path = tmpdir_path / f"{bucket_name}-cors.json"
+            cors_path.write_text(json.dumps(cors_rules, indent=2), encoding="utf-8")
+            print(f"  Applying permissive CORS to {bucket_name}...")
+            run_command(
+                [
+                    "aws",
+                    "s3api",
+                    "put-bucket-cors",
+                    "--bucket",
+                    bucket_name,
+                    "--cors-configuration",
+                    str(cors_path.resolve()),
+                ]
+            )
+            created.append(bucket_name)
     return created
 
 

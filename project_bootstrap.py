@@ -182,6 +182,7 @@ class UserConfig:
     node_api: Optional[NodeAPIConfig] = None
     configure_dns: bool = False
     domain_name: Optional[str] = None
+    frontend_subdir: str = "."
 
 
 @dataclass
@@ -220,6 +221,7 @@ class ExecutionContext:
     godaddy_api_key: Optional[str] = field(default_factory=lambda: os.environ.get("GODADDY_API_KEY"))
     godaddy_api_secret: Optional[str] = field(default_factory=lambda: os.environ.get("GODADDY_API_SECRET"))
     domain_configured: bool = False
+    frontend_root: Optional[Path] = None
 
     def _require_active_step(self) -> str:
         if not self.active_step:
@@ -278,6 +280,11 @@ class ExecutionContext:
         if key is None:
             return data
         return data.get(key, default)
+
+    def require_frontend_root(self) -> Path:
+        if self.frontend_root is None:
+            raise BootstrapError("Angular project root has not been resolved.")
+        return self.frontend_root
 
 
 class StepExecutor:
@@ -910,6 +917,8 @@ def collect_user_config(args: argparse.Namespace) -> UserConfig:
             start_command=start_command,
         )
 
+    frontend_subdir = input("\nAngular project root relative to repository (default '.'): ").strip() or "."
+
     configure_dns = False
     domain_name: Optional[str] = None
     if not args.dry_run:
@@ -930,6 +939,7 @@ def collect_user_config(args: argparse.Namespace) -> UserConfig:
         node_api=node_api_config,
         configure_dns=configure_dns,
         domain_name=domain_name,
+        frontend_subdir=frontend_subdir,
     )
 
 
@@ -944,6 +954,17 @@ def build_replacements(config: UserConfig) -> Dict[str, str]:
         DEFAULT_PLACEHOLDER_PUBLIC_NAME: public,
     }
     return replacements
+
+
+def discover_angular_roots(base: Path) -> List[Path]:
+    candidates: List[Path] = []
+    for angular_file in base.rglob("angular.json"):
+        if any(part.lower() == "node_modules" for part in angular_file.parts):
+            continue
+        resolved = angular_file.parent.resolve()
+        if resolved not in candidates:
+            candidates.append(resolved)
+    return candidates
 
 
 def delete_firebase_project(project_id: str) -> None:
@@ -1006,6 +1027,53 @@ def rollback_clone_repository(ctx: ExecutionContext) -> None:
         raise BootstrapError(f"Failed to remove cloned repository: {exc}") from exc
 
 
+def step_resolve_frontend_root(ctx: ExecutionContext) -> None:
+    project_dir = ctx.config.project_dir
+    requested = ctx.config.frontend_subdir.strip()
+    if requested in {"", ".", "./"}:
+        requested_path = project_dir
+    else:
+        requested_path = (project_dir / requested).resolve()
+
+    search_base = requested_path if requested_path.exists() else project_dir
+
+    candidates: List[Path] = []
+    if requested_path.exists() and (requested_path / "angular.json").exists():
+        candidates = [requested_path]
+    else:
+        candidates = discover_angular_roots(search_base)
+        if not candidates and search_base != project_dir:
+            candidates = discover_angular_roots(project_dir)
+
+    if not candidates:
+        raise BootstrapError(
+            f"Unable to locate Angular workspace (angular.json) under {search_base}. "
+            "Provide the correct relative path when prompted."
+        )
+    if len(candidates) > 1:
+        rel_candidates = []
+        for path in candidates:
+            try:
+                rel_candidates.append(str(path.relative_to(project_dir)))
+            except ValueError:
+                rel_candidates.append(str(path))
+        joined = ", ".join(rel_candidates)
+        raise BootstrapError(
+            "Multiple Angular workspaces detected: "
+            f"{joined}. Please rerun and specify the desired angular project root."
+        )
+
+    frontend_root = candidates[0]
+    ctx.frontend_root = frontend_root
+    try:
+        rel_path = frontend_root.relative_to(project_dir)
+        display = "." if str(rel_path) == "." else str(rel_path)
+    except ValueError:
+        display = str(frontend_root)
+    ctx.add_step_data("frontend_root", display)
+    print(f"Angular project root resolved to: {display}")
+
+
 def step_replace_placeholders(ctx: ExecutionContext) -> None:
     changed = replace_placeholders(ctx.config.project_dir, ctx.replacements, ctx=ctx)
     ctx.add_step_data("files_changed", changed)
@@ -1017,19 +1085,16 @@ def rollback_restore_files(ctx: ExecutionContext) -> None:
 
 
 def step_update_environment_files(ctx: ExecutionContext) -> None:
-    count = update_environment_files(
-        ctx.config.project_dir,
-        ctx.config.app_internal_name,
-        ctx.config.stack.features,
-        ctx=ctx,
-    )
+    root = ctx.require_frontend_root()
+    count = update_environment_files(root, ctx.config.app_internal_name, ctx.config.stack.features, ctx=ctx)
     ctx.add_step_data("files_updated", count)
     if count:
         print(f"Updated {count} environment file(s).")
 
 
 def step_copy_build_directories(ctx: ExecutionContext) -> None:
-    created = copy_build_directories(ctx.config.project_dir, ctx.config.app_internal_name, ENVIRONMENTS, ctx=ctx)
+    root = ctx.require_frontend_root()
+    created = copy_build_directories(root, ctx.config.app_internal_name, ENVIRONMENTS, ctx=ctx)
     ctx.add_step_data("created_paths", [str(path) for path in created])
     if created:
         print(f"Duplicated {len(created)} build director{'ies' if len(created) != 1 else 'y'}.")
@@ -1077,8 +1142,9 @@ def step_update_firebase_configs(ctx: ExecutionContext) -> None:
     if not ctx.env_sites:
         print("No Firebase hosting sites detected; skipping Firebase config updates.")
         return
-    firebaserc_updated = update_firebaserc(ctx.config.project_dir, ctx.config.firebase_project_id, ctx.env_sites, ctx=ctx)
-    firebase_json_updated = update_firebase_json(ctx.config.project_dir, ctx.config.firebase_project_id, ctx.env_sites, ctx=ctx)
+    root = ctx.require_frontend_root()
+    firebaserc_updated = update_firebaserc(root, ctx.config.firebase_project_id, ctx.env_sites, ctx=ctx)
+    firebase_json_updated = update_firebase_json(root, ctx.config.firebase_project_id, ctx.env_sites, ctx=ctx)
     ctx.add_step_data("firebaserc_updated", firebaserc_updated)
     ctx.add_step_data("firebase_json_updated", firebase_json_updated)
     if firebaserc_updated or firebase_json_updated:
@@ -1155,6 +1221,7 @@ def rollback_restore_godaddy_dns(ctx: ExecutionContext) -> None:
 def build_steps(ctx: ExecutionContext) -> List[Step]:
     steps: List[Step] = [
         Step("Clone template repository", step_clone_repository, rollback_clone_repository),
+        Step("Resolve Angular project root", step_resolve_frontend_root),
         Step("Replace project placeholders", step_replace_placeholders, rollback_restore_files),
         Step("Update Angular environment files", step_update_environment_files, rollback_restore_files),
         Step("Copy build directories", step_copy_build_directories, rollback_remove_generated_paths),
@@ -1234,6 +1301,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print(f" - Stack: {config.stack.label}")
     print(f" - Features: {features_display}")
     print(f" - Project directory: {config.project_dir}")
+    print(f" - Angular project root: {config.frontend_subdir}")
     print(f" - Clone template: {'yes' if config.should_clone else 'no'}")
     print(f" - Firebase project id: {config.firebase_project_id}")
     if config.node_api:

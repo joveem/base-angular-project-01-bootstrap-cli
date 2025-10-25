@@ -1299,7 +1299,13 @@ def configure_godaddy_dns(
     except json.JSONDecodeError as exc:
         raise BootstrapError(f"Could not parse existing GoDaddy records: {exc}") from exc
 
-    records = [
+    ns_records = [
+        record
+        for record in existing_records
+        if isinstance(record, dict) and record.get("type", "").upper() == "NS"
+    ]
+
+    records = ns_records + [
         {"type": "A", "name": "@", "data": FIREBASE_HOSTING_IP, "ttl": 600},
         {"type": "CNAME", "name": "www", "data": FIREBASE_CNAME, "ttl": 600},
     ]

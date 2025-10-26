@@ -168,6 +168,11 @@ STACK_OPTIONS: Sequence[StackOption] = [
 ]
 
 STACK_OPTIONS_BY_KEY = {option.key: option for option in STACK_OPTIONS}
+RAILWAY_BRANCH_MAP: Dict[str, str] = {
+    "development": "development-01",
+    "beta": "beta-01",
+    "prod": "production-01",
+}
 
 
 def load_last_session() -> Optional[Dict[str, Any]]:
@@ -259,7 +264,6 @@ class ExecutionContext:
     step_created_paths: Dict[str, List[Path]] = field(default_factory=dict)
     step_data: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     active_step: Optional[str] = None
-    railway_api_token: Optional[str] = field(default_factory=lambda: os.environ.get("RAILWAY_API_TOKEN"))
     godaddy_api_key: Optional[str] = field(default_factory=lambda: os.environ.get("GODADDY_API_KEY"))
     godaddy_api_secret: Optional[str] = field(default_factory=lambda: os.environ.get("GODADDY_API_SECRET"))
     domain_configured: bool = False
@@ -1189,8 +1193,9 @@ def configure_railway_services(
             command_parts.extend(["--project", project_id])
         if node_config.repo_url:
             command_parts.extend(["--source", node_config.repo_url])
-        if node_config.branch:
-            command_parts.extend(["--branch", node_config.branch])
+        deploy_branch = RAILWAY_BRANCH_MAP.get(env, node_config.branch or "")
+        if deploy_branch:
+            command_parts.extend(["--branch", deploy_branch])
         if node_config.root_dir and node_config.root_dir != ".":
             command_parts.extend(["--root", node_config.root_dir])
         suggested_cmd = " ".join(command_parts)
@@ -1202,6 +1207,8 @@ def configure_railway_services(
         else:
             print("  Railway CLI not detected. Install the Railway CLI to run commands like:")
             print(f"    {suggested_cmd}")
+        if deploy_branch:
+            print(f"  Auto-deploy branch: {deploy_branch}")
         print("  After creating the service, configure build and start commands within Railway as needed.")
 
         log_remaining(

@@ -22,6 +22,7 @@ import argparse
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import textwrap
@@ -255,6 +256,47 @@ class StepExecutionError(BootstrapError):
         self.original = original
 
 
+def _make_path_writable(path: Path) -> None:
+    try:
+        mode = path.stat().st_mode
+    except FileNotFoundError:
+        return
+    except PermissionError:
+        mode = None
+    if mode is not None:
+        try:
+            path.chmod(mode | stat.S_IWRITE)
+            return
+        except PermissionError:
+            pass
+    try:
+        os.chmod(str(path), stat.S_IWRITE)
+    except (FileNotFoundError, PermissionError):
+        pass
+
+
+def remove_path_force(path: Path) -> None:
+    if not path.exists():
+        return
+
+    def _handle_error(func: Callable[[str], None], target: str, exc_info: Any) -> None:
+        target_path = Path(target)
+        _make_path_writable(target_path)
+        try:
+            func(target)
+        except Exception as error:
+            raise error
+
+    if path.is_dir():
+        shutil.rmtree(path, onerror=_handle_error)
+    else:
+        try:
+            path.unlink()
+        except PermissionError:
+            _make_path_writable(path)
+            path.unlink()
+
+
 @dataclass
 class ExecutionContext:
     args: argparse.Namespace
@@ -305,10 +347,7 @@ class ExecutionContext:
         failures: List[str] = []
         for path in reversed(paths):
             try:
-                if path.is_dir():
-                    shutil.rmtree(path)
-                elif path.exists():
-                    path.unlink()
+                remove_path_force(path)
             except Exception as exc:
                 failures.append(f"{path}: {exc}")
         if failures:
@@ -1990,10 +2029,10 @@ def rollback_clone_repository(ctx: ExecutionContext) -> None:
     target = ctx.config.project_dir
     try:
         if target.exists():
-            shutil.rmtree(target)
+            remove_path_force(target)
         temp_dir = target.parent / DEFAULT_TEMPLATE_DIRNAME
         if temp_dir.exists():
-            shutil.rmtree(temp_dir)
+            remove_path_force(temp_dir)
     except Exception as exc:
         raise BootstrapError(f"Failed to remove cloned repository: {exc}") from exc
 
@@ -2027,7 +2066,7 @@ def rollback_clone_api_template(ctx: ExecutionContext) -> None:
     api_path = Path(api_path_str)
     try:
         if api_path.exists():
-            shutil.rmtree(api_path)
+            remove_path_force(api_path)
     except Exception as exc:
         raise BootstrapError(f"Failed to remove cloned API repository: {exc}") from exc
 
@@ -2037,10 +2076,10 @@ def rollback_clone_api_template(ctx: ExecutionContext) -> None:
     target = ctx.config.project_dir
     try:
         if target.exists():
-            shutil.rmtree(target)
+            remove_path_force(target)
         temp_dir = target.parent / DEFAULT_TEMPLATE_DIRNAME
         if temp_dir.exists():
-            shutil.rmtree(temp_dir)
+            remove_path_force(temp_dir)
     except Exception as exc:
         raise BootstrapError(f"Failed to remove cloned repository: {exc}") from exc
 

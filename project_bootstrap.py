@@ -1097,6 +1097,12 @@ def enable_firestore(project_id: str) -> bool:
                 f"Enable Firestore for '{project_id}' once billing is activated (automation skipped)."
             )
             return False
+        if "has not been used" in combined or "api has not been used" in combined or "is disabled" in combined:
+            print("  Cloud Firestore API is disabled; enable it in Google Cloud console and retry.")
+            log_remaining(
+                f"Enable Cloud Firestore API for '{project_id}' in Google Cloud console, then create the database."
+            )
+            return False
         if "already exists" in combined:
             print("  Firestore database already exists; continuing.")
             return False

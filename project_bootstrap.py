@@ -1099,13 +1099,77 @@ def enable_firestore(project_id: str) -> bool:
     return True
 
 
-def create_firebase_hosting_sites(project_id: str, environments: Sequence[str]) -> Tuple[Dict[str, str], List[str]]:
-    env_sites = {}
+def list_firebase_hosting_sites(project_id: str) -> Optional[Set[str]]:
+    try:
+        result = run_command(
+            ["firebase", "hosting:sites:list", "--project", project_id, "--json"],
+            check=False,
+        )
+    except BootstrapError as exc:
+        if is_command_missing_error(exc, "firebase"):
+            print("  Firebase CLI not available; cannot list Firebase Hosting sites.")
+            log_remaining("Review Firebase Hosting sites manually (command unavailable).")
+            return None
+        print(f"  Warning: Failed to list Firebase Hosting sites: {exc}")
+        return None
+
+    if result.returncode != 0:
+        combined = (result.stderr or result.stdout or "").lower()
+        if "unknown option '--json'" in combined:
+            print("  Firebase CLI does not support --json for hosting:sites:list; skipping site discovery.")
+            return None
+        print("  Warning: firebase hosting:sites:list failed; skipping site discovery.")
+        return None
+
+    try:
+        payload = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError:
+        print("  Warning: Unexpected output from hosting:sites:list; skipping site discovery.")
+        return None
+
+    sites: Set[str] = set()
+
+    def _collect(obj: Any) -> None:
+        if isinstance(obj, dict):
+            site_id = obj.get("siteId") or obj.get("name")
+            if isinstance(site_id, str):
+                if site_id.startswith("sites/"):
+                    site_id = site_id.split("/", 1)[-1]
+                sites.add(site_id)
+            for value in obj.values():
+                _collect(value)
+        elif isinstance(obj, list):
+            for entry in obj:
+                _collect(entry)
+
+    _collect(payload)
+    return sites or None
+
+
+def create_firebase_hosting_sites(
+    project_id: str,
+    environments: Sequence[str],
+    ctx: Optional[ExecutionContext] = None,
+) -> Tuple[Dict[str, str], List[str]]:
+    env_sites: Dict[str, str] = {}
     created_sites: List[str] = []
+    existing_sites = list_firebase_hosting_sites(project_id)
+    frontend_root: Optional[Path] = None
+    if ctx is not None:
+        try:
+            frontend_root = ctx.require_frontend_root()
+        except BootstrapError:
+            if ctx.config.project_dir.exists():
+                frontend_root = ctx.config.project_dir
     for env in environments:
         if env == "local":
             continue
         site_id = f"{project_id}-{env}"
+        if existing_sites:
+            if site_id in existing_sites:
+                print(f"  Hosting site {site_id} already exists; using existing site.")
+                env_sites[env] = site_id
+                continue
         print(f"\nCreating Firebase Hosting site '{site_id}'...")
         try:
             result = run_command(
@@ -1122,13 +1186,39 @@ def create_firebase_hosting_sites(project_id: str, environments: Sequence[str]) 
             combined = (result.stderr or result.stdout or "").lower()
             if "already exists" in combined:
                 print(f"  Hosting site {site_id} already exists; using existing site.")
+                env_sites[env] = site_id
+                if existing_sites is not None:
+                    existing_sites.add(site_id)
+                continue
             else:
                 raise BootstrapError(
                     f"Failed to create Firebase Hosting site {site_id}: {result.stderr or result.stdout or 'unknown error'}"
                 )
-        else:
-            created_sites.append(site_id)
+        created_sites.append(site_id)
         env_sites[env] = site_id
+        if existing_sites is not None:
+            existing_sites.add(site_id)
+
+    default_site = project_id
+    removed_default = False
+    if (
+        existing_sites
+        and "prod" in env_sites
+        and env_sites["prod"] != default_site
+        and default_site in existing_sites
+    ):
+        print(f"\nRemoving default Firebase Hosting site '{default_site}' to avoid duplicates.")
+        try:
+            delete_firebase_hosting_site(project_id, default_site, cwd=frontend_root)
+        except BootstrapError as exc:
+            print(f"  Warning: Could not remove default hosting site '{default_site}': {exc}")
+            log_remaining(f"Remove default Firebase Hosting site '{default_site}' manually (automation failed).")
+        else:
+            removed_default = True
+
+    if removed_default and ctx is not None:
+        ctx.add_step_data("removed_default_hosting_site", True)
+
     return env_sites, created_sites
 
 
@@ -2381,14 +2471,21 @@ def rollback_disable_firestore(ctx: ExecutionContext) -> None:
 
 
 def step_create_firebase_hosting_sites(ctx: ExecutionContext) -> None:
-    env_sites, created_sites = create_firebase_hosting_sites(ctx.config.firebase_project_id, ENVIRONMENTS)
+    env_sites, created_sites = create_firebase_hosting_sites(
+        ctx.config.firebase_project_id,
+        ENVIRONMENTS,
+        ctx=ctx,
+    )
     ctx.env_sites.update(env_sites)
     ctx.add_step_data("created_sites", created_sites)
 
 
 def rollback_delete_firebase_hosting_sites(ctx: ExecutionContext) -> None:
     project_id = ctx.config.firebase_project_id
-    project_dir = ctx.config.project_dir if ctx.config.project_dir.exists() else None
+    try:
+        project_dir = ctx.require_frontend_root()
+    except BootstrapError:
+        project_dir = ctx.config.project_dir if ctx.config.project_dir.exists() else None
     for site_id in ctx.get_step_data().get("created_sites", []):
         delete_firebase_hosting_site(project_id, site_id, cwd=project_dir)
 

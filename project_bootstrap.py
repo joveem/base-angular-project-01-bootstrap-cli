@@ -954,7 +954,7 @@ def firebase_project_exists(project_id: str) -> Optional[bool]:
     print(f"\nChecking Firebase project availability for '{project_id}'...")
     try:
         result = run_command(
-            ["firebase", "projects:list", "--filter", project_id, "--json"],
+            ["firebase", "projects:list", "--json"],
             check=False,
         )
     except BootstrapError as exc:
@@ -965,6 +965,19 @@ def firebase_project_exists(project_id: str) -> Optional[bool]:
         raise
 
     if result.returncode != 0:
+        stderr = (result.stderr or "").lower()
+        if "--json" in stderr and "unknown option" in stderr:
+            plain_result = run_command(
+                ["firebase", "projects:list"],
+                check=False,
+            )
+            if plain_result.returncode != 0:
+                message = plain_result.stderr or plain_result.stdout or "unknown error"
+                raise BootstrapError(f"Failed to list Firebase projects: {message}")
+            lines = (plain_result.stdout or "").splitlines()
+            exists = any(project_id in line for line in lines)
+            print(f"  Firebase project '{project_id}' {'found' if exists else 'not found'}.")
+            return exists
         message = result.stderr or result.stdout or "unknown error"
         raise BootstrapError(f"Failed to list Firebase projects: {message}")
 

@@ -1175,7 +1175,7 @@ def create_firebase_hosting_sites(
         print(f"\nCreating Firebase Hosting site '{site_id}'...")
         try:
             result = run_command(
-                ["firebase", "hosting:sites:create", site_id, "--project", project_id],
+                ["firebase", "hosting:sites:create", site_id, "--project", project_id, "--non-interactive"],
                 check=False,
             )
         except BootstrapError as exc:
@@ -1186,7 +1186,7 @@ def create_firebase_hosting_sites(
             raise
         if result.returncode != 0:
             combined = (result.stderr or result.stdout or "").lower()
-            if "already exists" in combined:
+            if "already exists" in combined or "resource already exists" in combined:
                 print(f"  Hosting site {site_id} already exists; using existing site.")
                 env_sites[env] = site_id
                 if existing_sites is not None:

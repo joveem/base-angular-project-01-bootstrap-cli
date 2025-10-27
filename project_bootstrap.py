@@ -2153,7 +2153,7 @@ def delete_firestore_database(project_id: str) -> None:
         raise BootstrapError(f"Failed to delete Firestore database: {combined}")
 
 
-def delete_firebase_hosting_site(project_id: str, site_id: str) -> None:
+def delete_firebase_hosting_site(project_id: str, site_id: str, cwd: Optional[Path] = None) -> None:
     print(f"  Deleting Firebase Hosting site '{site_id}'...")
     command = [
         "firebase",
@@ -2163,7 +2163,7 @@ def delete_firebase_hosting_site(project_id: str, site_id: str) -> None:
         project_id,
         "--force",
     ]
-    result = run_command(command, check=False)
+    result = run_command(command, cwd=cwd, check=False)
     if result.returncode != 0:
         stderr = (result.stderr or "").lower()
         stdout = (result.stdout or "").lower()
@@ -2177,6 +2177,7 @@ def delete_firebase_hosting_site(project_id: str, site_id: str) -> None:
                     "--project",
                     project_id,
                 ],
+                cwd=cwd,
                 check=False,
             )
     if result.returncode != 0:
@@ -2387,8 +2388,9 @@ def step_create_firebase_hosting_sites(ctx: ExecutionContext) -> None:
 
 def rollback_delete_firebase_hosting_sites(ctx: ExecutionContext) -> None:
     project_id = ctx.config.firebase_project_id
+    project_dir = ctx.config.project_dir if ctx.config.project_dir.exists() else None
     for site_id in ctx.get_step_data().get("created_sites", []):
-        delete_firebase_hosting_site(project_id, site_id)
+        delete_firebase_hosting_site(project_id, site_id, cwd=project_dir)
 
 
 def step_update_firebase_configs(ctx: ExecutionContext) -> None:

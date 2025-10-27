@@ -2927,6 +2927,7 @@ def build_steps(ctx: ExecutionContext) -> List[Step]:
     features = ctx.config.stack.features
 
     needs_firestore = "firestore" in features or "node_api" in features
+    railway_step: Optional[Step] = None
 
     if ctx.config.dry_run:
         log_remaining("Create Firebase project (dry-run prevented automation).")
@@ -2953,7 +2954,7 @@ def build_steps(ctx: ExecutionContext) -> List[Step]:
         if ctx.config.dry_run:
             log_remaining("Create Railway services (dry-run prevented automation).")
         else:
-            steps.append(Step("Plan Railway services", step_configure_railway_services, rollback_delete_railway_services))
+            railway_step = Step("Plan Railway services", step_configure_railway_services, rollback_delete_railway_services)
 
     if ctx.config.configure_dns:
         if ctx.config.dry_run:
@@ -2965,6 +2966,8 @@ def build_steps(ctx: ExecutionContext) -> List[Step]:
                 log_remaining("Configure GoDaddy DNS records (missing GODADDY_API_KEY / GODADDY_API_SECRET).")
 
     steps.append(Step("Sync GitHub repositories", step_sync_github_repositories))
+    if railway_step is not None:
+        steps.append(railway_step)
     return steps
 
 

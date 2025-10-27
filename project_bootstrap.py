@@ -298,6 +298,11 @@ def remove_path_force(path: Path) -> None:
             path.unlink()
 
 
+def _file_uri_for_cli(path: Path) -> str:
+    resolved = path.resolve()
+    return f"file://{resolved.as_posix()}"
+
+
 def _prepare_command(command: Sequence[str]) -> List[str]:
     if not command:
         raise ValueError("Command cannot be empty.")
@@ -1339,7 +1344,7 @@ def create_s3_buckets(internal_name: str, environments: Sequence[str], ctx: Opti
                     "--bucket",
                     bucket_name,
                     "--policy",
-                    str(policy_path.resolve()),
+                    _file_uri_for_cli(policy_path),
                 ]
             )
 
@@ -1365,7 +1370,7 @@ def create_s3_buckets(internal_name: str, environments: Sequence[str], ctx: Opti
                     "--bucket",
                     bucket_name,
                     "--cors-configuration",
-                    str(cors_path.resolve()),
+                    _file_uri_for_cli(cors_path),
                 ]
             )
             created.append(bucket_name)

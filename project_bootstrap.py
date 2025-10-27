@@ -1055,59 +1055,72 @@ def create_firebase_project(project_id: str) -> bool:
 
 def enable_firestore(project_id: str) -> bool:
     print(f"\nEnabling Firestore for '{project_id}' (if not already enabled)...")
-    try:
+    include_location = True
+    attempted_api_enable = False
+
+    while True:
         command = [
             "firebase",
             "firestore:databases:create",
             "--project",
             project_id,
             "(default)",
-            "--location",
-            FIRESTORE_DEFAULT_LOCATION,
         ]
-        result = run_command(command, check=False)
-        if result.returncode != 0:
-            stderr = (result.stderr or "").lower()
-            stdout = (result.stdout or "").lower()
-            if "unknown option '--location'" in stderr or "unknown option '--location'" in stdout:
-                print("  Firebase CLI does not support --location; retrying without it.")
-                result = run_command(
-                    [
-                        "firebase",
-                        "firestore:databases:create",
-                        "--project",
-                        project_id,
-                        "(default)",
-                    ],
-                    check=False,
-                )
-    except BootstrapError as exc:
-        if is_command_missing_error(exc, "firebase"):
-            print("  Firebase CLI not available; skipping Firestore enablement.")
-            log_remaining("Enable Firestore database via Firebase CLI (command unavailable).")
-            return False
-        raise
+        if include_location:
+            command.extend(["--location", FIRESTORE_DEFAULT_LOCATION])
 
-    if result.returncode != 0:
+        try:
+            result = run_command(command, check=False)
+        except BootstrapError as exc:
+            if is_command_missing_error(exc, "firebase"):
+                print("  Firebase CLI not available; skipping Firestore enablement.")
+                log_remaining("Enable Firestore database via Firebase CLI (command unavailable).")
+                return False
+            raise
+
+        if result.returncode == 0:
+            return True
+
         combined_text = result.stderr or result.stdout or ""
         combined = combined_text.lower()
+
+        if include_location and "unknown option '--location'" in combined:
+            print("  Firebase CLI does not support --location; retrying without it.")
+            include_location = False
+            continue
+
+        if ("has not been used" in combined or "api has not been used" in combined or "is disabled" in combined) and not attempted_api_enable:
+            attempted_api_enable = True
+            if ensure_command_available("gcloud"):
+                print("  Cloud Firestore API is disabled; attempting to enable it via gcloud...")
+                enable_result = run_command(
+                    ["gcloud", "services", "enable", "firestore.googleapis.com", "--project", project_id],
+                    check=False,
+                )
+                if enable_result.returncode == 0:
+                    print("  Cloud Firestore API enabled; retrying database creation...")
+                    continue
+                enable_output = enable_result.stderr or enable_result.stdout or "unknown error"
+                print(f"  Warning: gcloud failed to enable Firestore API ({enable_output}).")
+            else:
+                print("  gcloud CLI not available; cannot enable Firestore API automatically.")
+            log_remaining(
+                f"Enable Cloud Firestore API for '{project_id}' in Google Cloud console, then create the database."
+            )
+            return False
+
         if "requires billing" in combined or "enable billing" in combined:
             print("  Firestore requires billing to be enabled; skipping automation.")
             log_remaining(
                 f"Enable Firestore for '{project_id}' once billing is activated (automation skipped)."
             )
             return False
-        if "has not been used" in combined or "api has not been used" in combined or "is disabled" in combined:
-            print("  Cloud Firestore API is disabled; enable it in Google Cloud console and retry.")
-            log_remaining(
-                f"Enable Cloud Firestore API for '{project_id}' in Google Cloud console, then create the database."
-            )
-            return False
+
         if "already exists" in combined:
             print("  Firestore database already exists; continuing.")
             return False
+
         raise BootstrapError(f"Failed to enable Firestore: {combined_text or 'unknown error'}")
-    return True
 
 
 def list_firebase_hosting_sites(project_id: str) -> Optional[Set[str]]:

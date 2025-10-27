@@ -1135,6 +1135,8 @@ def list_firebase_hosting_sites(project_id: str) -> Optional[Set[str]]:
             if isinstance(site_id, str):
                 if site_id.startswith("sites/"):
                     site_id = site_id.split("/", 1)[-1]
+                elif "/sites/" in site_id:
+                    site_id = site_id.split("/sites/", 1)[-1]
                 sites.add(site_id)
             for value in obj.values():
                 _collect(value)

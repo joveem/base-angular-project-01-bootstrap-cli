@@ -1669,15 +1669,23 @@ def ensure_railway_project(
         return existing_id, False
 
     print(f"  Creating Railway project '{project_name}'...")
-    create_cmd = ["railway", "init", "--name", project_name, "--json"]
+    create_cmd = ["railway", "init", "--name", project_name]
     create_result = run_command(create_cmd, cwd=api_dir, check=False)
     if create_result.returncode != 0:
         print("  Warning: Failed to create Railway project automatically.")
         log_remaining(f"Create Railway project '{project_name}' manually using the Railway CLI or dashboard.")
         return None, False
 
-    created_data = _try_parse_json(create_result.stdout)
-    new_project_id = _extract_project_id_from_data(created_data) if created_data is not None else None
+    # Refresh list after creation
+    projects_cache = list_projects()
+    new_project_id = None
+    for project in projects_cache:
+        name_value = project.get("name") or project.get("projectName") or project.get("displayName")
+        if isinstance(name_value, str) and name_value.strip().lower() == project_name.lower():
+            new_project_id = _extract_project_id_from_data(project)
+            if new_project_id:
+                break
+
     if not new_project_id:
         status_result = run_command(
             ["railway", "status", "--json"],

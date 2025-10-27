@@ -33,6 +33,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from urllib.parse import urlparse
 
 TEMPLATE_REPO_URL = "https://github.com/joveem/base-angular-project-01.git"
 DEFAULT_TEMPLATE_DIRNAME = "base-angular-project-01"
@@ -1768,8 +1769,9 @@ def ensure_railway_service(
             )
             return None
     command: List[str] = ["railway", "add", "--service", service_name]
-    if repo_url:
-        command.extend(["--repo", repo_url])
+    repo_slug = repo_slug_for_railway(repo_url)
+    if repo_slug:
+        command.extend(["--repo", repo_slug])
     add_result = run_command(command, cwd=api_dir, check=False)
     if add_result.returncode == 0:
         print(f"  Railway service created: {service_name}")
@@ -1822,9 +1824,10 @@ def configure_railway_services(
         if env == "local":
             continue
         service_name = f"{internal_name}-{env}-api"
+        repo_slug = repo_slug_for_railway(node_config.repo_url)
         add_command: List[str] = ["railway", "add", "--service", service_name]
-        if node_config.repo_url:
-            add_command.extend(["--repo", node_config.repo_url])
+        if repo_slug:
+            add_command.extend(["--repo", repo_slug])
         suggested_cmd = " ".join(add_command)
         deploy_branch = RAILWAY_BRANCH_MAP.get(env, node_config.branch or "")
 
@@ -1838,7 +1841,7 @@ def configure_railway_services(
         if automation_possible:
             env_result = ensure_railway_environment(api_dir, env_hint) if env_hint else False
             if env_result is not None:
-                service_result = ensure_railway_service(api_dir, env_hint, service_name, node_config.repo_url)
+                service_result = ensure_railway_service(api_dir, env_hint, service_name, repo_slug)
                 if service_result is not None:
                     manual_follow_up = False
         else:
@@ -2154,6 +2157,24 @@ def generate_default_api_repo(internal_name: str, owner: Optional[str] = None) -
 
 def api_repo_directory_name(internal_name: str) -> str:
     return insert_api_segment(internal_name)
+
+
+def repo_slug_for_railway(repo_url: Optional[str]) -> Optional[str]:
+    if not repo_url:
+        return None
+    value = repo_url.strip()
+    if not value:
+        return None
+    if value.endswith(".git"):
+        value = value[:-4]
+    if value.startswith("git@"):
+        _, _, path = value.partition(":")
+        return path.strip("/") if path else None
+    if "://" in value:
+        parsed = urlparse(value)
+        slug = (parsed.path or "").strip("/")
+        return slug or None
+    return value
 
 
 class Questionnaire:

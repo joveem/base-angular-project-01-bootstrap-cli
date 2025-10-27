@@ -1003,9 +1003,21 @@ def firebase_project_exists(project_id: str) -> Optional[bool]:
 def create_firebase_project(project_id: str, display_name: str) -> bool:
     print(f"\nCreating Firebase project '{project_id}'...")
     try:
-        run_command(
-            ["firebase", "projects:create", project_id, "--display-name", display_name, "--quiet"],
-        )
+        command = ["firebase", "projects:create", project_id, "--display-name", display_name, "--quiet"]
+        result = run_command(command, check=False)
+        if result.returncode != 0:
+            stderr = (result.stderr or "").lower()
+            stdout = (result.stdout or "").lower()
+            if "unknown option '--quiet'" in stderr or "unknown option '--quiet'" in stdout:
+                print("  Firebase CLI does not support --quiet; retrying without it.")
+                retry_result = run_command(
+                    ["firebase", "projects:create", project_id, "--display-name", display_name],
+                    check=False,
+                )
+                result = retry_result
+        if result.returncode != 0:
+            combined = result.stderr or result.stdout or "unknown error"
+            raise BootstrapError(f"Failed to create Firebase project: {combined}")
         return True
     except BootstrapError as exc:
         if is_command_missing_error(exc, "firebase"):

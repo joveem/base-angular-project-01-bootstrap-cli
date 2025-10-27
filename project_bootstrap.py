@@ -34,10 +34,9 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set,
 
 TEMPLATE_REPO_URL = "https://github.com/joveem/base-angular-project-01.git"
 DEFAULT_TEMPLATE_DIRNAME = "base-angular-project-01"
-DEFAULT_PLACEHOLDER_INTERNAL = "base-angular-project-01"
-DEFAULT_PLACEHOLDER_INTERNAL_CAMEL = "BaseAngularProjects01"
-DEFAULT_PLACEHOLDER_PUBLIC = "BaseAngularProjects01"
-DEFAULT_PLACEHOLDER_PUBLIC_NAME = "Base Angular Projects 01"
+PROJECT_PLACEHOLDER_ID = "BASE-ANGULAR-PROJECT-ID"
+PROJECT_PLACEHOLDER_PUBLIC_NAME = "BASE-ANGULAR-PROJECT-PUBLIC-NAME"
+PROJECT_PLACEHOLDER_PUBLIC_NOSPACE = "BASE-ANGULAR-PROJECT-PUBLIC-LOWERCASED-NOSPACE-NAME"
 AWS_REGION = "sa-east-1"
 FIREBASE_HOSTING_IP = "199.36.158.100"
 FIREBASE_CNAME = "ghs.googlehosted.com"
@@ -1032,6 +1031,8 @@ def update_environment_files(root: Path, internal_name: str, features: Set[str],
     updated_count = 0
 
     for path in env_files:
+        if path.name in {"environment.ts", "environment.local.ts"}:
+            continue
         try:
             text = path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
@@ -1323,12 +1324,11 @@ def collect_user_config(args: argparse.Namespace, previous_answers: Optional[Dic
 def build_replacements(config: UserConfig) -> Dict[str, str]:
     internal = config.app_internal_name
     public = config.app_public_name
+    public_nospace = public.replace(" ", "").lower()
     replacements = {
-        DEFAULT_PLACEHOLDER_INTERNAL: internal,
-        DEFAULT_PLACEHOLDER_INTERNAL.upper(): internal.upper(),
-        DEFAULT_PLACEHOLDER_INTERNAL_CAMEL: internal.replace("-", " ").title().replace(" ", ""),
-        DEFAULT_PLACEHOLDER_PUBLIC: public.replace(" ", ""),
-        DEFAULT_PLACEHOLDER_PUBLIC_NAME: public,
+        PROJECT_PLACEHOLDER_ID: internal,
+        PROJECT_PLACEHOLDER_PUBLIC_NAME: public,
+        PROJECT_PLACEHOLDER_PUBLIC_NOSPACE: public_nospace,
     }
     return replacements
 

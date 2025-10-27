@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
+import shutil
 import subprocess
 import sys
+from pathlib import Path
 
 PROJECT_IDS = [
     "idk-test-ws-03",
@@ -18,17 +20,36 @@ PROJECT_IDS = [
 ]
 
 
+def resolve_gcloud_executable() -> str:
+    """Return the first usable gcloud executable or exit with instructions."""
+    candidates = [
+        "gcloud",
+        "gcloud.cmd",
+        "gcloud.exe",
+        str(Path.home() / "AppData/Local/Google/Cloud SDK/google-cloud-sdk/bin/gcloud.CMD"),
+    ]
+    for candidate in candidates:
+        resolved = shutil.which(candidate)
+        if resolved:
+            return resolved
+    print("gcloud CLI not found. Install Google Cloud SDK or add it to PATH.")
+    sys.exit(2)
+
+
+GCLOUD = resolve_gcloud_executable()
+
+
 def delete_project(project_id: str) -> bool:
     print(f"\nDeleting {project_id}...")
     result = subprocess.run(
-        ["gcloud", "projects", "delete", project_id, "--quiet"],
+        [GCLOUD, "projects", "delete", project_id, "--quiet"],
         capture_output=True,
         text=True,
     )
     if result.returncode == 0:
-        print(f"  ✔ Deleted {project_id}")
+        print(f"  OK Deleted {project_id}")
         return True
-    print(f"  ✖ Failed to delete {project_id}: {result.stderr or result.stdout or 'unknown error'}")
+    print(f"  !! Failed to delete {project_id}: {result.stderr or result.stdout or 'unknown error'}")
     return False
 
 

@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -1554,7 +1555,155 @@ def create_s3_buckets(internal_name: str, environments: Sequence[str], ctx: Opti
     
     
     
+def _try_parse_json(output: str) -> Optional[Any]:
+    if not output:
+        return None
+    output = output.strip()
+    if not output:
+        return None
+    candidates: List[str] = []
+    candidates.append(output)
+    candidates.extend(line.strip() for line in output.splitlines() if line.strip())
+    candidates.extend(match.group(0) for match in re.finditer(r"(\{.*?\}|\[.*?\])", output, re.DOTALL))
+    seen: Set[str] = set()
+    for candidate in candidates:
+        candidate = candidate.strip()
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        if not (candidate.startswith("{") or candidate.startswith("[")):
+            continue
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
+def _extract_project_id_from_data(data: Any) -> Optional[str]:
+    if isinstance(data, str):
+        value = data.strip()
+        if value:
+            return value
+        return None
+    if isinstance(data, dict):
+        for key in ("id", "projectId", "project_id", "projectID"):
+            value = data.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        for value in data.values():
+            result = _extract_project_id_from_data(value)
+            if result:
+                return result
+    if isinstance(data, list):
+        for item in data:
+            result = _extract_project_id_from_data(item)
+            if result:
+                return result
+    return None
+
+
+def _extract_projects_collection(data: Any) -> List[Dict[str, Any]]:
+    if isinstance(data, list):
+        return [item for item in data if isinstance(item, dict)]
+    if isinstance(data, dict):
+        for key in ("projects", "result", "data", "items", "value"):
+            value = data.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+        project = data.get("project")
+        if isinstance(project, dict):
+            return [project]
+    return []
+
+
+def ensure_railway_project(
+    ctx: ExecutionContext,
+    internal_name: str,
+    node_config: NodeAPIConfig,
+    cli_available: bool,
+) -> Tuple[Optional[str], bool]:
+    if not cli_available:
+        return node_config.railway_project_id, False
+
+    api_dir = ctx.config.repo_parent / f"{internal_name}-api"
+    if not api_dir.exists():
+        print(f"  Railway automation skipped: API directory {api_dir} not found.")
+        return node_config.railway_project_id, False
+
+    project_id = (node_config.railway_project_id or "").strip()
+    project_name = f"{internal_name}-api"
+
+    def list_projects() -> List[Dict[str, Any]]:
+        result = run_command(
+            ["railway", "list", "--json"],
+            cwd=api_dir,
+            check=False,
+        )
+        if result.returncode != 0:
+            return []
+        data = _try_parse_json(result.stdout)
+        if data is None:
+            return []
+        return _extract_projects_collection(data)
+
+    if project_id:
+        return project_id, False
+
+    projects_cache = list_projects()
+    existing_id: Optional[str] = None
+    for project in projects_cache:
+        name_value = project.get("name") or project.get("projectName") or project.get("displayName")
+        if isinstance(name_value, str) and name_value.strip().lower() == project_name.lower():
+            existing_id = _extract_project_id_from_data(project)
+            if existing_id:
+                break
+
+    if existing_id:
+        print(f"  Using existing Railway project '{project_name}' (id: {existing_id}).")
+        run_command(
+            ["railway", "link", "--project", existing_id],
+            cwd=api_dir,
+            check=False,
+        )
+        return existing_id, False
+
+    print(f"  Creating Railway project '{project_name}'...")
+    create_cmd = ["railway", "init", "--name", project_name, "--json"]
+    create_result = run_command(create_cmd, cwd=api_dir, check=False)
+    if create_result.returncode != 0:
+        print("  Warning: Failed to create Railway project automatically.")
+        log_remaining(f"Create Railway project '{project_name}' manually using the Railway CLI or dashboard.")
+        return None, False
+
+    created_data = _try_parse_json(create_result.stdout)
+    new_project_id = _extract_project_id_from_data(created_data) if created_data is not None else None
+    if not new_project_id:
+        status_result = run_command(
+            ["railway", "status", "--json"],
+            cwd=api_dir,
+            check=False,
+        )
+        if status_result.returncode == 0:
+            status_data = _try_parse_json(status_result.stdout)
+            new_project_id = _extract_project_id_from_data(status_data)
+
+    if not new_project_id:
+        print("  Warning: Unable to determine Railway project id after creation.")
+        log_remaining(f"Confirm the Railway project id for '{project_name}' and update the CLI configuration.")
+        return None, False
+
+    run_command(
+        ["railway", "link", "--project", new_project_id],
+        cwd=api_dir,
+        check=False,
+    )
+    print(f"  Railway project created: {project_name} (id: {new_project_id}).")
+    return new_project_id, True
+
+
 def configure_railway_services(
+    ctx: ExecutionContext,
     internal_name: str,
     environments: Sequence[str],
     node_config: NodeAPIConfig,
@@ -1562,6 +1711,25 @@ def configure_railway_services(
     created_services: List[str] = []
     project_id = (node_config.railway_project_id or "").strip()
     cli_available = shutil.which("railway") is not None
+    project_created = False
+
+    if cli_available and not ctx.config.dry_run:
+        ensured_id, created = ensure_railway_project(ctx, internal_name, node_config, cli_available)
+        if ensured_id:
+            project_id = ensured_id.strip()
+            project_created = created
+            if project_id and project_id != (node_config.railway_project_id or "").strip():
+                ctx.config.node_api = NodeAPIConfig(
+                    repo_url=node_config.repo_url,
+                    branch=node_config.branch,
+                    root_dir=node_config.root_dir,
+                    build_command=node_config.build_command,
+                    start_command=node_config.start_command,
+                    railway_project_id=project_id,
+                )
+                node_config = ctx.config.node_api
+        else:
+            project_id = (node_config.railway_project_id or "").strip()
 
     for env in environments:
         if env == "local":
@@ -1575,20 +1743,15 @@ def configure_railway_services(
 
         link_command: Optional[str] = None
         if project_id:
-            link_parts: List[str] = ["railway", "link", "--project", project_id]
-            environment_hint = RAILWAY_BRANCH_MAP.get(env)
-            if environment_hint:
-                link_parts.extend(["--environment", environment_hint])
-            link_command = " ".join(link_parts)
+            link_command = f"railway link --project {project_id}"
 
         print(f"\nRailway provisioning for '{service_name}':")
         if link_command:
-            print("  Link the CLI to the target project/environment (run once inside your API repo):")
+            print("  Link the CLI to the target project (run inside your API repo):")
             print(f"    {link_command}")
         else:
             print("  Link the CLI to the desired Railway project before creating the service:")
             print("    railway link")
-            print("    railway environment <your-environment>")
 
         env_hint = RAILWAY_BRANCH_MAP.get(env)
         if cli_available:
@@ -1611,14 +1774,15 @@ def configure_railway_services(
 
         follow_up = f"Create Railway service '{service_name}' using 'railway add --service {service_name}'"
         if project_id:
-            follow_up += f" after 'railway link --project {project_id}"
-            if env_hint:
-                follow_up += f" --environment {env_hint}"
-            follow_up += "'"
+            follow_up += f" after 'railway link --project {project_id}'"
         else:
             follow_up += " after linking the CLI to the desired project/environment"
         log_remaining(follow_up + ".")
         created_services.append(service_name)
+
+    if project_created and project_id:
+        ctx.add_step_data("railway_project_id", project_id)
+
     return created_services
 
 
@@ -1628,6 +1792,7 @@ def step_configure_railway_services(ctx: ExecutionContext) -> None:
         log_remaining("Create Railway services manually (node API configuration missing).")
         return
     services = configure_railway_services(
+        ctx,
         ctx.config.app_internal_name,
         ENVIRONMENTS,
         node_config,

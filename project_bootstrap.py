@@ -1058,7 +1058,7 @@ def enable_firestore(project_id: str) -> bool:
     include_location = True
     attempted_api_enable = False
 
-    while True:
+    def _firebase_create() -> subprocess.CompletedProcess:
         command = [
             "firebase",
             "firestore:databases:create",
@@ -1069,8 +1069,11 @@ def enable_firestore(project_id: str) -> bool:
         if include_location:
             command.extend(["--location", FIRESTORE_DEFAULT_LOCATION])
 
+        return run_command(command, check=False)
+
+    while True:
         try:
-            result = run_command(command, check=False)
+            result = _firebase_create()
         except BootstrapError as exc:
             if is_command_missing_error(exc, "firebase"):
                 print("  Firebase CLI not available; skipping Firestore enablement.")
@@ -1089,7 +1092,11 @@ def enable_firestore(project_id: str) -> bool:
             include_location = False
             continue
 
-        if ("has not been used" in combined or "api has not been used" in combined or "is disabled" in combined) and not attempted_api_enable:
+        api_disabled = (
+            "has not been used" in combined or "api has not been used" in combined or "is disabled" in combined
+        )
+
+        if api_disabled and not attempted_api_enable:
             attempted_api_enable = True
             if ensure_command_available("gcloud"):
                 print("  Cloud Firestore API is disabled; attempting to enable it via gcloud...")
@@ -1099,15 +1106,43 @@ def enable_firestore(project_id: str) -> bool:
                 )
                 if enable_result.returncode == 0:
                     print("  Cloud Firestore API enabled; retrying database creation...")
-                    continue
-                enable_output = enable_result.stderr or enable_result.stdout or "unknown error"
-                print(f"  Warning: gcloud failed to enable Firestore API ({enable_output}).")
+                    # After enabling the API, some projects require creating the database via gcloud once.
+                    gcloud_available = True
+                else:
+                    enable_output = enable_result.stderr or enable_result.stdout or "unknown error"
+                    print(f"  Warning: gcloud failed to enable Firestore API ({enable_output}).")
+                    gcloud_available = False
             else:
                 print("  gcloud CLI not available; cannot enable Firestore API automatically.")
-            log_remaining(
-                f"Enable Cloud Firestore API for '{project_id}' in Google Cloud console, then create the database."
-            )
-            return False
+                gcloud_available = False
+
+            if gcloud_available:
+                create_result = run_command(
+                    [
+                        "gcloud",
+                        "firestore",
+                        "databases",
+                        "create",
+                        "--project",
+                        project_id,
+                        "--region",
+                        FIRESTORE_DEFAULT_LOCATION,
+                    ],
+                    check=False,
+                )
+                create_output = create_result.stderr or create_result.stdout or ""
+                create_lower = create_output.lower()
+                if create_result.returncode == 0 or "already exists" in create_lower or "already in use" in create_lower:
+                    print("  Firestore database created via gcloud; continuing.")
+                    return True
+                print(f"  Warning: gcloud failed to create Firestore database ({create_output}).")
+            else:
+                log_remaining(
+                    f"Enable Cloud Firestore API for '{project_id}' in Google Cloud console, then create the database."
+                )
+                return False
+            # After gcloud attempts, retry Firebase CLI once more (loop continues)
+            continue
 
         if "requires billing" in combined or "enable billing" in combined:
             print("  Firestore requires billing to be enabled; skipping automation.")

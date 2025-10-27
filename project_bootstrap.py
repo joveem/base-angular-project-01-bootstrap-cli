@@ -42,6 +42,8 @@ FIREBASE_HOSTING_IP = "199.36.158.100"
 FIREBASE_CNAME = "ghs.googlehosted.com"
 ENVIRONMENTS = ["local", "development", "beta", "prod"]
 DEFAULT_GITHUB_OWNER = "joveem"
+NODE_API_TEMPLATE_URL = "https://github.com/joveem/base-nodejs-api-01.git"
+NODE_API_TEMPLATE_DIRNAME = "base-nodejs-api-01"
 REMOVABLE_DOMAIN_SUFFIXES: Set[str] = {
     "api",
     "apis",
@@ -850,6 +852,20 @@ def git_clone_template(target_dir: Path, repo_url: str = TEMPLATE_REPO_URL) -> P
     return target_dir
 
 
+def git_clone_repo(repo_url: str, expected_dirname: str, target_dir: Path) -> Path:
+    if target_dir.exists():
+        raise BootstrapError(f"Target directory {target_dir} already exists.")
+    parent = target_dir.parent
+    temp_dir = parent / expected_dirname
+    if temp_dir.exists():
+        raise BootstrapError(f"Temporary path {temp_dir} already exists. Please remove it first.")
+    run_command(["git", "clone", repo_url], cwd=parent)
+    if not temp_dir.exists():
+        raise BootstrapError(f"Cloned repository expected at {temp_dir} but was not found.")
+    temp_dir.rename(target_dir)
+    return target_dir
+
+
 def replace_placeholders(
     root: Path,
     replacements: Dict[str, str],
@@ -1230,6 +1246,60 @@ def step_configure_railway_services(ctx: ExecutionContext) -> None:
         node_config,
     )
     ctx.add_step_data("railway_services", services)
+
+
+
+def ensure_github_repo(owner: str, repo_name: str, visibility: str = "private") -> None:
+    if shutil.which("gh") is None:
+        raise BootstrapError("GitHub CLI (gh) not available.")
+    view_result = run_command(["gh", "repo", "view", f"{owner}/{repo_name}"], check=False)
+    if view_result.returncode == 0:
+        return
+    visibility_flag = "--public" if visibility == "public" else "--private"
+    run_command(["gh", "repo", "create", f"{owner}/{repo_name}", visibility_flag, "--confirm"], cwd=None)
+
+
+def configure_git_remote_and_push(repo_path: Path, owner: str, repo_name: str, branch: str) -> None:
+    repo_url = f"git@github.com:{owner}/{repo_name}.git"
+    run_command(["git", "remote", "remove", "origin"], cwd=repo_path, check=False)
+    run_command(["git", "remote", "add", "origin", repo_url], cwd=repo_path)
+    run_command(["git", "checkout", "-B", branch], cwd=repo_path)
+    run_command(["git", "add", "-A"], cwd=repo_path)
+    commit = run_command(["git", "commit", "-m", "chore: bootstrap project"], cwd=repo_path, check=False)
+    if commit.returncode not in (0, 1):
+        raise BootstrapError("Git commit failed.")
+    if commit.returncode == 1:
+        combined = (commit.stdout + commit.stderr).lower()
+        if "nothing to commit" not in combined:
+            raise BootstrapError("Git commit failed: unable to create initial commit.")
+    run_command(["git", "push", "-u", "origin", branch], cwd=repo_path)
+
+
+def step_sync_github_repositories(ctx: ExecutionContext) -> None:
+    if ctx.config.dry_run:
+        log_remaining("Create and push GitHub repositories (dry-run prevented automation).")
+        return
+    if shutil.which("gh") is None:
+        log_remaining("Create GitHub repositories manually (gh CLI missing).")
+        return
+    owner = detect_default_git_owner()
+    client_repo = ctx.config.project_dir.name
+    try:
+        ensure_github_repo(owner, client_repo)
+        configure_git_remote_and_push(ctx.config.project_dir, owner, client_repo, "main-01")
+    except BootstrapError as exc:
+        log_remaining(f"Configure GitHub repository '{client_repo}' manually: {exc}")
+    if ctx.config.node_api:
+        api_dir = ctx.config.repo_parent / f"{ctx.config.app_internal_name}-api"
+        if not api_dir.exists():
+            log_remaining("Push Node API repository manually (directory missing).")
+        else:
+            api_repo = api_dir.name
+            try:
+                ensure_github_repo(owner, api_repo)
+                configure_git_remote_and_push(api_dir, owner, api_repo, "main-01")
+            except BootstrapError as exc:
+                log_remaining(f"Configure GitHub repository '{api_repo}' manually: {exc}")
 
 
 def rollback_delete_railway_services(ctx: ExecutionContext) -> None:
@@ -1891,6 +1961,53 @@ def rollback_clone_repository(ctx: ExecutionContext) -> None:
         raise BootstrapError(f"Failed to remove cloned repository: {exc}") from exc
 
 
+
+def step_clone_api_template(ctx: ExecutionContext) -> None:
+    if "node_api" not in ctx.config.stack.features:
+        print("Node API not selected; skipping API template clone.")
+        return
+    api_dir = ctx.config.repo_parent / f"{ctx.config.app_internal_name}-api"
+    ctx.add_step_data("api_repo_path", str(api_dir))
+    if ctx.config.dry_run:
+        log_remaining(f"Clone Node API template into {api_dir} (dry-run prevented automation).")
+        ctx.add_step_data("api_cloned", False)
+        return
+    if api_dir.exists():
+        print(f"API directory {api_dir} already exists. Skipping clone.")
+        ctx.add_step_data("api_cloned", False)
+        return
+    git_clone_repo(NODE_API_TEMPLATE_URL, NODE_API_TEMPLATE_DIRNAME, api_dir)
+    ctx.add_step_data("api_cloned", True)
+
+
+def rollback_clone_api_template(ctx: ExecutionContext) -> None:
+    data = ctx.get_step_data()
+    if not data.get("api_cloned"):
+        return
+    api_path_str = data.get("api_repo_path")
+    if not api_path_str:
+        return
+    api_path = Path(api_path_str)
+    try:
+        if api_path.exists():
+            shutil.rmtree(api_path)
+    except Exception as exc:
+        raise BootstrapError(f"Failed to remove cloned API repository: {exc}") from exc
+
+    data = ctx.get_step_data()
+    if not data.get("cloned"):
+        return
+    target = ctx.config.project_dir
+    try:
+        if target.exists():
+            shutil.rmtree(target)
+        temp_dir = target.parent / DEFAULT_TEMPLATE_DIRNAME
+        if temp_dir.exists():
+            shutil.rmtree(temp_dir)
+    except Exception as exc:
+        raise BootstrapError(f"Failed to remove cloned repository: {exc}") from exc
+
+
 def step_resolve_frontend_root(ctx: ExecutionContext) -> None:
     project_dir = ctx.config.project_dir
     requested = ctx.config.frontend_subdir.strip()
@@ -2058,6 +2175,7 @@ def rollback_restore_godaddy_dns(ctx: ExecutionContext) -> None:
 
 def build_steps(ctx: ExecutionContext) -> List[Step]:
     steps: List[Step] = [
+        Step("Clone Node API template", step_clone_api_template, rollback_clone_api_template),
         Step("Clone template repository", step_clone_repository, rollback_clone_repository),
         Step("Resolve Angular project root", step_resolve_frontend_root),
         Step("Replace project placeholders", step_replace_placeholders, rollback_restore_files),
@@ -2103,6 +2221,7 @@ def build_steps(ctx: ExecutionContext) -> List[Step]:
             else:
                 log_remaining("Configure GoDaddy DNS records (missing GODADDY_API_KEY / GODADDY_API_SECRET).")
 
+    steps.append(Step("Sync GitHub repositories", step_sync_github_repositories))
     return steps
 
 

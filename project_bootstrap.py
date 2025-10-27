@@ -1090,12 +1090,18 @@ def enable_firestore(project_id: str) -> bool:
             log_remaining("Enable Firestore database via Firebase CLI (command unavailable).")
             return False
         raise
-    if result.returncode != 0:
-        combined = (result.stderr or result.stdout or "").lower()
-        if "already exists" in combined:
-            print("  Firestore database already exists; continuing.")
-            return False
-        raise BootstrapError(f"Failed to enable Firestore: {result.stderr or result.stdout or 'unknown error'}")
+        if result.returncode != 0:
+            combined = (result.stderr or result.stdout or "").lower()
+            if "requires billing" in combined or "enable billing" in combined:
+                print("  Firestore requires billing to be enabled; skipping automation.")
+                log_remaining(
+                    f"Enable Firestore for '{project_id}' once billing is activated (automation skipped)."
+                )
+                return False
+            if "already exists" in combined:
+                print("  Firestore database already exists; continuing.")
+                return False
+            raise BootstrapError(f"Failed to enable Firestore: {result.stderr or result.stdout or 'unknown error'}")
     return True
 
 

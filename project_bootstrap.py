@@ -1635,13 +1635,13 @@ def ensure_railway_project(
     if not cli_available:
         return node_config.railway_project_id, False
 
-    api_dir = ctx.config.repo_parent / f"{internal_name}-api"
+    api_dir = ctx.config.repo_parent / api_repo_directory_name(internal_name)
     if not api_dir.exists():
         print(f"  Railway automation skipped: API directory {api_dir} not found.")
         return node_config.railway_project_id, False
 
     project_id = (node_config.railway_project_id or "").strip()
-    project_name = f"{internal_name}-api"
+    project_name = api_repo_directory_name(internal_name)
 
     def list_projects() -> List[Dict[str, Any]]:
         result = run_command(
@@ -1796,7 +1796,7 @@ def configure_railway_services(
     cli_available = shutil.which("railway") is not None
     project_created = False
 
-    api_dir = ctx.config.repo_parent / f"{internal_name}-api"
+    api_dir = ctx.config.repo_parent / api_repo_directory_name(internal_name)
     automation_base = cli_available and not ctx.config.dry_run and api_dir.exists()
 
     if automation_base:
@@ -1933,7 +1933,7 @@ def step_sync_github_repositories(ctx: ExecutionContext) -> None:
     except BootstrapError as exc:
         log_remaining(f"Configure GitHub repository '{client_repo}' manually: {exc}")
     if ctx.config.node_api:
-        api_dir = ctx.config.repo_parent / f"{ctx.config.app_internal_name}-api"
+        api_dir = ctx.config.repo_parent / api_repo_directory_name(ctx.config.app_internal_name)
         if not api_dir.exists():
             log_remaining("Push Node API repository manually (directory missing).")
         else:
@@ -2150,6 +2150,10 @@ def generate_default_api_repo(internal_name: str, owner: Optional[str] = None) -
     else:
         repo_name_with_suffix = repo_name
     return f"git@github.com:{repo_owner}/{repo_name_with_suffix}"
+
+
+def api_repo_directory_name(internal_name: str) -> str:
+    return insert_api_segment(internal_name)
 
 
 class Questionnaire:
@@ -2687,7 +2691,7 @@ def step_clone_api_template(ctx: ExecutionContext) -> None:
     if "node_api" not in ctx.config.stack.features:
         print("Node API not selected; skipping API template clone.")
         return
-    api_dir = ctx.config.repo_parent / f"{ctx.config.app_internal_name}-api"
+    api_dir = ctx.config.repo_parent / api_repo_directory_name(ctx.config.app_internal_name)
     ctx.add_step_data("api_repo_path", str(api_dir))
     if ctx.config.dry_run:
         log_remaining(f"Clone Node API template into {api_dir} (dry-run prevented automation).")
@@ -3073,7 +3077,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not ctx.config.dry_run:
         run_npm_install(config.project_dir)
         if config.node_api:
-            api_dir = ctx.config.repo_parent / f"{ctx.config.app_internal_name}-api"
+            api_dir = ctx.config.repo_parent / api_repo_directory_name(ctx.config.app_internal_name)
             node_root = Path(config.node_api.root_dir or ".")
             run_npm_install(api_dir / node_root)
 

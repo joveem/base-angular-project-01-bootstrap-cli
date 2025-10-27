@@ -1551,10 +1551,19 @@ def create_s3_buckets(internal_name: str, environments: Sequence[str], ctx: Opti
                 )
             created.append(bucket_name)
     return created
-    
-    
-    
-    
+
+
+
+
+def run_npm_install(path: Path) -> None:
+    package_json = path / "package.json"
+    if not package_json.exists():
+        print(f"  package.json not found in {path}; skipping npm install.")
+        return
+    print(f"\nRunning npm install in {path}...")
+    run_command(["npm", "install"], cwd=path)
+
+
 def _try_parse_json(output: str) -> Optional[Any]:
     if not output:
         return None
@@ -3060,6 +3069,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 1
 
     print("Automation complete.\n")
+
+    if not ctx.config.dry_run:
+        run_npm_install(config.project_dir)
+        if config.node_api:
+            api_dir = ctx.config.repo_parent / f"{ctx.config.app_internal_name}-api"
+            node_root = Path(config.node_api.root_dir or ".")
+            run_npm_install(api_dir / node_root)
+
     if not ctx.domain_configured:
         summarise_dns_instructions(config.app_public_name, config.app_internal_name)
 
@@ -3071,7 +3088,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         for item in remaining_tasks:
             print(f" - {item}")
         print()
-    print("Bootstrap complete. Happy building!\n")
+    print("\033[92m############ bootstrap complete! ############\033[0m\n")
     return 0
 
 

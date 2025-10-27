@@ -45,6 +45,7 @@ ENVIRONMENTS = ["local", "development", "beta", "prod"]
 DEFAULT_GITHUB_OWNER = "joveem"
 NODE_API_TEMPLATE_URL = "https://github.com/joveem/base-nodejs-api-01.git"
 NODE_API_TEMPLATE_DIRNAME = "base-nodejs-api-01"
+FIRESTORE_DEFAULT_LOCATION = os.environ.get("FIRESTORE_DEFAULT_LOCATION", "nam5")
 REMOVABLE_DOMAIN_SUFFIXES: Set[str] = {
     "api",
     "apis",
@@ -1030,10 +1031,34 @@ def create_firebase_project(project_id: str, display_name: str) -> bool:
 def enable_firestore(project_id: str) -> bool:
     print(f"\nEnabling Firestore for '{project_id}' (if not already enabled)...")
     try:
-        result = run_command(
-            ["firebase", "firestore:databases:create", "--project", project_id, "(default)"],
-            check=False,
-        )
+        command = [
+            "firebase",
+            "firestore:databases:create",
+            "--project",
+            project_id,
+            "(default)",
+            "--location",
+            FIRESTORE_DEFAULT_LOCATION,
+        ]
+        result = run_command(command, check=False)
+        if result.returncode != 0:
+            stderr = (result.stderr or "").lower()
+            stdout = (result.stdout or "").lower()
+            if "unknown option '--location'" in stderr or "unknown option '--location'" in stdout:
+                print("  Firebase CLI does not support --location; retrying without it.")
+                result = run_command(
+                    [
+                        "firebase",
+                        "firestore:databases:create",
+                        "--project",
+                        project_id,
+                        "(default)",
+                    ],
+                    check=False,
+                )
+        if result.returncode != 0:
+            combined = result.stderr or result.stdout or "unknown error"
+            raise BootstrapError(f"Failed to enable Firestore: {combined}")
     except BootstrapError as exc:
         if is_command_missing_error(exc, "firebase"):
             print("  Firebase CLI not available; skipping Firestore enablement.")
@@ -2045,17 +2070,94 @@ class Questionnaire:
 
 def delete_firebase_project(project_id: str) -> None:
     print(f"  Deleting Firebase project '{project_id}'...")
-    run_command(["firebase", "projects:delete", project_id, "--force"])
+    command = ["firebase", "projects:delete", project_id, "--force"]
+    result = run_command(command, check=False)
+    if result.returncode != 0:
+        stderr = (result.stderr or "").lower()
+        stdout = (result.stdout or "").lower()
+        if "unknown option '--force'" in stderr or "unknown option '--force'" in stdout:
+            print("  Firebase CLI does not support --force; retrying with --non-interactive.")
+            result = run_command(
+                ["firebase", "projects:delete", project_id, "--non-interactive"],
+                check=False,
+            )
+    if result.returncode != 0 and ensure_command_available("gcloud"):
+        print("  Firebase CLI deletion failed; attempting gcloud fallback.")
+        gcloud_result = run_command(
+            ["gcloud", "projects", "delete", project_id, "--quiet"],
+            check=False,
+        )
+        if gcloud_result.returncode == 0:
+            return
+        result = gcloud_result
+    if result.returncode != 0:
+        combined = result.stderr or result.stdout or "unknown error"
+        log_remaining(f"Delete Firebase project '{project_id}' manually (CLI command failed).")
+        raise BootstrapError(f"Failed to delete Firebase project: {combined}")
 
 
 def delete_firestore_database(project_id: str) -> None:
     print(f"  Deleting Firestore database for '{project_id}'...")
-    run_command(["firebase", "firestore:databases:delete", "(default)", "--project", project_id, "--force"])
+    command = [
+        "firebase",
+        "firestore:databases:delete",
+        "(default)",
+        "--project",
+        project_id,
+        "--force",
+    ]
+    result = run_command(command, check=False)
+    if result.returncode != 0:
+        stderr = (result.stderr or "").lower()
+        stdout = (result.stdout or "").lower()
+        if "unknown option '--force'" in stderr or "unknown option '--force'" in stdout:
+            print("  Firebase CLI does not support --force; retrying without it.")
+            result = run_command(
+                [
+                    "firebase",
+                    "firestore:databases:delete",
+                    "(default)",
+                    "--project",
+                    project_id,
+                ],
+                check=False,
+            )
+    if result.returncode != 0:
+        combined = result.stderr or result.stdout or "unknown error"
+        log_remaining(f"Delete Firestore database '(default)' for '{project_id}' manually (CLI command failed).")
+        raise BootstrapError(f"Failed to delete Firestore database: {combined}")
 
 
 def delete_firebase_hosting_site(project_id: str, site_id: str) -> None:
     print(f"  Deleting Firebase Hosting site '{site_id}'...")
-    run_command(["firebase", "hosting:sites:delete", site_id, "--project", project_id, "--force"])
+    command = [
+        "firebase",
+        "hosting:sites:delete",
+        site_id,
+        "--project",
+        project_id,
+        "--force",
+    ]
+    result = run_command(command, check=False)
+    if result.returncode != 0:
+        stderr = (result.stderr or "").lower()
+        stdout = (result.stdout or "").lower()
+        if "unknown option '--force'" in stderr or "unknown option '--force'" in stdout:
+            print("  Firebase CLI does not support --force; retrying without it.")
+            result = run_command(
+                [
+                    "firebase",
+                    "hosting:sites:delete",
+                    site_id,
+                    "--project",
+                    project_id,
+                ],
+                check=False,
+            )
+    if result.returncode != 0:
+        combined = result.stderr or result.stdout or "unknown error"
+        log_remaining(f"Delete Firebase Hosting site '{site_id}' manually (CLI command failed).")
+        raise BootstrapError(f"Failed to delete Firebase Hosting site: {combined}")
 
 
 def delete_s3_bucket(bucket_name: str) -> None:

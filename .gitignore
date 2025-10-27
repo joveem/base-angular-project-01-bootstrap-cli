@@ -23,3 +23,4 @@ Thumbs.db
 
 # Local environment files
 .env
+.bootstrap_last_session.json

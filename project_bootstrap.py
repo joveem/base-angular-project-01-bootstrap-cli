@@ -890,6 +890,43 @@ def replace_placeholders(
     return changed
 
 
+def firebase_project_exists(project_id: str) -> Optional[bool]:
+    print(f"\nChecking Firebase project availability for '{project_id}'...")
+    try:
+        result = run_command(
+            ["firebase", "projects:list", "--filter", project_id, "--json"],
+            check=False,
+        )
+    except BootstrapError as exc:
+        if is_command_missing_error(exc, "firebase"):
+            print("  Firebase CLI not available; cannot verify project existence.")
+            log_remaining("Verify Firebase project presence via Firebase CLI (command unavailable).")
+            return None
+        raise
+
+    if result.returncode != 0:
+        message = result.stderr or result.stdout or "unknown error"
+        raise BootstrapError(f"Failed to list Firebase projects: {message}")
+
+    try:
+        payload = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        raise BootstrapError(f"Unexpected Firebase CLI output while checking projects: {exc}") from exc
+
+    projects = []
+    if isinstance(payload, dict):
+        projects = payload.get("results") or payload.get("projects") or []
+    elif isinstance(payload, list):
+        projects = payload
+
+    exists = any(
+        isinstance(entry, dict) and entry.get("projectId") == project_id
+        for entry in projects
+    )
+    print(f"  Firebase project '{project_id}' {'found' if exists else 'not found'}.")
+    return exists
+
+
 def create_firebase_project(project_id: str, display_name: str) -> bool:
     print(f"\nCreating Firebase project '{project_id}'...")
     try:
@@ -2086,7 +2123,15 @@ def rollback_remove_generated_paths(ctx: ExecutionContext) -> None:
 
 
 def step_create_firebase_project(ctx: ExecutionContext) -> None:
-    created = create_firebase_project(ctx.config.firebase_project_id, ctx.config.app_public_name)
+    project_id = ctx.config.firebase_project_id
+    exists = firebase_project_exists(project_id)
+    ctx.add_step_data("project_exists", exists)
+    if exists:
+        print(f"Firebase project '{project_id}' already exists. Skipping creation.")
+        ctx.add_step_data("project_created", False)
+        return
+
+    created = create_firebase_project(project_id, ctx.config.app_public_name)
     ctx.add_step_data("project_created", created)
 
 
@@ -2185,15 +2230,17 @@ def build_steps(ctx: ExecutionContext) -> List[Step]:
 
     features = ctx.config.stack.features
 
+    needs_firestore = "firestore" in features or "node_api" in features
+
     if ctx.config.dry_run:
         log_remaining("Create Firebase project (dry-run prevented automation).")
-        if "firestore" in features:
+        if needs_firestore:
             log_remaining("Enable Firestore (dry-run prevented automation).")
         log_remaining("Create Firebase Hosting sites (dry-run prevented automation).")
         log_remaining("Update Firebase configuration files (dry-run prevented automation).")
     else:
         steps.append(Step("Create Firebase project", step_create_firebase_project, rollback_delete_firebase_project))
-        if "firestore" in features:
+        if needs_firestore:
             steps.append(Step("Enable Firestore", step_enable_firestore, rollback_disable_firestore))
         steps.append(
             Step("Create Firebase Hosting sites", step_create_firebase_hosting_sites, rollback_delete_firebase_hosting_sites)

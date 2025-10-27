@@ -1513,31 +1513,39 @@ def configure_railway_services(
         if env == "local":
             continue
         service_name = f"{internal_name}-{env}-api"
-        command_parts = ["railway", "service", "create", service_name]
-        if project_id:
-            command_parts.extend(["--project", project_id])
+        add_command: List[str] = ["railway", "add", "--service", service_name]
         if node_config.repo_url:
-            command_parts.extend(["--source", node_config.repo_url])
+            add_command.extend(["--repo", node_config.repo_url])
+        suggested_cmd = " ".join(add_command)
         deploy_branch = RAILWAY_BRANCH_MAP.get(env, node_config.branch or "")
-        if deploy_branch:
-            command_parts.extend(["--branch", deploy_branch])
-        if node_config.root_dir and node_config.root_dir != ".":
-            command_parts.extend(["--root", node_config.root_dir])
-        suggested_cmd = " ".join(command_parts)
 
         print(f"\nRailway provisioning for '{service_name}':")
+        if project_id:
+            print("  Link the CLI to the target project (run once from your API repo):")
+            print(f"    railway link --project {project_id}")
+        else:
+            print("  Link the CLI to the desired Railway project before creating the service (use 'railway link').")
+
         if cli_available:
-            print("  Suggested CLI command (run inside your Node API repository):")
+            print("  Create the service via CLI:")
             print(f"    {suggested_cmd}")
         else:
-            print("  Railway CLI not detected. Install the Railway CLI to run commands like:")
+            print("  Railway CLI not detected. Install it or use the Railway dashboard. Suggested command:")
             print(f"    {suggested_cmd}")
+
         if deploy_branch:
-            print(f"  Auto-deploy branch: {deploy_branch}")
-        print("  After creating the service, configure build and start commands within Railway as needed.")
+            print(f"  Recommended auto-deploy branch: {deploy_branch}")
+        if node_config.build_command:
+            print(f"  Configure build command: {node_config.build_command}")
+        if node_config.start_command:
+            print(f"  Configure start command: {node_config.start_command}")
+        if node_config.root_dir and node_config.root_dir != ".":
+            print(f"  If the repo is monorepo, set working directory: {node_config.root_dir}")
+
+        print("  After creation, verify environment variables and deploy settings in Railway.")
 
         log_remaining(
-            f"Create Railway service '{service_name}' (project: {project_id or 'specify project id'}) using the Railway CLI or dashboard."
+            f"Create Railway service '{service_name}' using 'railway add --service {service_name}' (link project first)."
         )
         created_services.append(service_name)
     return created_services

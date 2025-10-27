@@ -1433,7 +1433,7 @@ def create_s3_buckets(internal_name: str, environments: Sequence[str], ctx: Opti
             policy_path = tmpdir_path / f"{bucket_name}-policy.json"
             policy_path.write_text(json.dumps(policy, indent=2), encoding="utf-8")
             print(f"  Applying public-read policy to {bucket_name}...")
-            run_command(
+            policy_result = run_command(
                 [
                     "aws",
                     "s3api",
@@ -1442,8 +1442,26 @@ def create_s3_buckets(internal_name: str, environments: Sequence[str], ctx: Opti
                     bucket_name,
                     "--policy",
                     _file_uri_for_cli(policy_path),
-                ]
+                ],
+                check=False,
             )
+            if policy_result.returncode != 0:
+                combined_policy_output = policy_result.stderr or policy_result.stdout or ""
+                combined_policy_lower = combined_policy_output.lower()
+                if (
+                    "blockpublicpolicy" in combined_policy_lower
+                    or "block public access" in combined_policy_lower
+                    or "accessdenied" in combined_policy_lower
+                ):
+                    print("  Bucket policy blocked by AWS public access settings; recording manual follow-up.")
+                    log_remaining(
+                        f"Review public access settings and policy for S3 bucket '{bucket_name}' (automation blocked)."
+                    )
+                else:
+                    raise BootstrapError(
+                        f"Failed to apply bucket policy to {bucket_name}: "
+                        f"{combined_policy_output or 'unknown error'}"
+                    )
 
             cors_rules = {
                 "CORSRules": [
@@ -1459,7 +1477,7 @@ def create_s3_buckets(internal_name: str, environments: Sequence[str], ctx: Opti
             cors_path = tmpdir_path / f"{bucket_name}-cors.json"
             cors_path.write_text(json.dumps(cors_rules, indent=2), encoding="utf-8")
             print(f"  Applying permissive CORS to {bucket_name}...")
-            run_command(
+            cors_result = run_command(
                 [
                     "aws",
                     "s3api",
@@ -1468,8 +1486,14 @@ def create_s3_buckets(internal_name: str, environments: Sequence[str], ctx: Opti
                     bucket_name,
                     "--cors-configuration",
                     _file_uri_for_cli(cors_path),
-                ]
+                ],
+                check=False,
             )
+            if cors_result.returncode != 0:
+                raise BootstrapError(
+                    f"Failed to apply CORS configuration to {bucket_name}: "
+                    f"{cors_result.stderr or cors_result.stdout or 'unknown error'}"
+                )
             created.append(bucket_name)
     return created
     

@@ -43,7 +43,13 @@ PROJECT_PLACEHOLDER_PUBLIC_NOSPACE = "BASE-ANGULAR-PROJECT-PUBLIC-LOWERCASED-NOS
 AWS_REGION = "sa-east-1"
 FIREBASE_HOSTING_IP = "199.36.158.100"
 FIREBASE_CNAME = "ghs.googlehosted.com"
-ENVIRONMENTS = ["local", "development", "beta", "prod"]
+ENVIRONMENT_KEYS = ["local", "development", "beta", "production"]
+ENVIRONMENT_SLUGS = {
+    "local": "local",
+    "development": "development-01",
+    "beta": "beta-01",
+    "production": "production-01",
+}
 DEFAULT_GITHUB_OWNER = "joveem"
 NODE_API_TEMPLATE_URL = "https://github.com/joveem/base-nodejs-api-01.git"
 NODE_API_TEMPLATE_DIRNAME = "base-nodejs-api-01"
@@ -176,7 +182,7 @@ STACK_OPTIONS_BY_KEY = {option.key: option for option in STACK_OPTIONS}
 RAILWAY_BRANCH_MAP: Dict[str, str] = {
     "development": "development-01",
     "beta": "beta-01",
-    "prod": "production-01",
+    "production": "production-01",
 }
 
 
@@ -1217,17 +1223,11 @@ def create_firebase_hosting_sites(
     env_sites: Dict[str, str] = {}
     created_sites: List[str] = []
     existing_sites = list_firebase_hosting_sites(project_id)
-    frontend_root: Optional[Path] = None
-    if ctx is not None:
-        try:
-            frontend_root = ctx.require_frontend_root()
-        except BootstrapError:
-            if ctx.config.project_dir.exists():
-                frontend_root = ctx.config.project_dir
     for env in environments:
         if env == "local":
             continue
-        site_id = f"{project_id}-{env}"
+        env_slug_value = environment_slug(env)
+        site_id = f"{project_id}-{env_slug_value}"
         if existing_sites:
             if site_id in existing_sites:
                 print(f"  Hosting site {site_id} already exists; using existing site.")
@@ -1261,26 +1261,6 @@ def create_firebase_hosting_sites(
         env_sites[env] = site_id
         if existing_sites is not None:
             existing_sites.add(site_id)
-
-    default_site = project_id
-    removed_default = False
-    if (
-        existing_sites
-        and "prod" in env_sites
-        and env_sites["prod"] != default_site
-        and default_site in existing_sites
-    ):
-        print(f"\nRemoving default Firebase Hosting site '{default_site}' to avoid duplicates.")
-        try:
-            delete_firebase_hosting_site(project_id, default_site, cwd=frontend_root)
-        except BootstrapError as exc:
-            print(f"  Warning: Could not remove default hosting site '{default_site}': {exc}")
-            log_remaining(f"Remove default Firebase Hosting site '{default_site}' manually (automation failed).")
-        else:
-            removed_default = True
-
-    if removed_default and ctx is not None:
-        ctx.add_step_data("removed_default_hosting_site", True)
 
     return env_sites, created_sites
 
@@ -1355,19 +1335,21 @@ def update_environment_files(root: Path, internal_name: str, features: Set[str],
         log_remaining("Environment files missing under src/environments; configure manually.")
         return 0
 
-    def desired_api_url(env: str) -> str:
-        if env == "local":
+    def desired_api_url(env_key: str) -> str:
+        slug = environment_slug(env_key)
+        if env_key == "local":
             return "http://localhost:3000"
         if "node_api" in features:
-            return f"https://{internal_name}-{env}.up.railway.app"
-        return "http://localhost:2829" if env == "local" else "https://api.example.com"
+            return f"https://{internal_name}-{slug}.up.railway.app"
+        return "http://localhost:2829" if env_key == "local" else "https://api.example.com"
 
-    def desired_cdn_url(env: str) -> str:
-        if env == "local":
+    def desired_cdn_url(env_key: str) -> str:
+        slug = environment_slug(env_key)
+        if env_key == "local":
             return "http://localhost:2828"
         if "aws_s3" in features:
-            return f"https://{internal_name}-{env}.s3.{AWS_REGION}.amazonaws.com"
-        return f"https://{internal_name}-{env}.web.app"
+            return f"https://{internal_name}-{slug}.s3.{AWS_REGION}.amazonaws.com"
+        return f"https://{internal_name}-{slug}.web.app"
 
     updated_count = 0
 
@@ -1379,25 +1361,28 @@ def update_environment_files(root: Path, internal_name: str, features: Set[str],
         except UnicodeDecodeError:
             continue
 
-        env_name = "prod"
-        if "development" in path.name:
-            env_name = "development"
-        elif "local" in path.name:
-            env_name = "local"
-        elif "beta" in path.name:
-            env_name = "beta"
-        elif "production" in path.name:
-            env_name = "prod"
+        name_lower = path.name.lower()
+        env_key = "production"
+        if "development" in name_lower:
+            env_key = "development"
+        elif "local" in name_lower:
+            env_key = "local"
+        elif "beta" in name_lower:
+            env_key = "beta"
+        elif "prod" in name_lower or "production" in name_lower:
+            env_key = "production"
+
+        env_slug_value = environment_slug(env_key)
 
         updated = text
-        updated = updated.replace("ENVIRONMENT_NAME: 'prod'", f"ENVIRONMENT_NAME: '{env_name}'")
-        updated = updated.replace('ENVIRONMENT_NAME: "prod"', f'ENVIRONMENT_NAME: "{env_name}"')
+        updated = re.sub(r"ENVIRONMENT_NAME:\s*'[^']*'", f"ENVIRONMENT_NAME: '{env_slug_value}'", updated)
+        updated = re.sub(r'ENVIRONMENT_NAME:\s*"[^"]*"', f'ENVIRONMENT_NAME: "{env_slug_value}"', updated)
 
-        updated = updated.replace("API_URL: 'http://localhost:2829'", f"API_URL: '{desired_api_url(env_name)}'")
-        updated = updated.replace('API_URL: "http://localhost:2829"', f'API_URL: "{desired_api_url(env_name)}"')
+        updated = updated.replace("API_URL: 'http://localhost:2829'", f"API_URL: '{desired_api_url(env_key)}'")
+        updated = updated.replace('API_URL: "http://localhost:2829"', f'API_URL: "{desired_api_url(env_key)}"')
 
-        updated = updated.replace("CDN_URL: 'http://localhost:2828'", f"CDN_URL: '{desired_cdn_url(env_name)}'")
-        updated = updated.replace('CDN_URL: "http://localhost:2828"', f'CDN_URL: "{desired_cdn_url(env_name)}"')
+        updated = updated.replace("CDN_URL: 'http://localhost:2828'", f"CDN_URL: '{desired_cdn_url(env_key)}'")
+        updated = updated.replace('CDN_URL: "http://localhost:2828"', f'CDN_URL: "{desired_cdn_url(env_key)}"')
 
         if updated != text:
             if ctx is not None:
@@ -1435,7 +1420,8 @@ def copy_build_directories(
     for env in environments:
         if env == "local":
             continue
-        destination = build_dir / f"{internal_name}-{env}"
+        env_slug_value = environment_slug(env)
+        destination = build_dir / f"{internal_name}-{env_slug_value}"
         if destination.exists():
             print(f"  Build directory {destination} already exists. Skipping.")
             continue
@@ -1453,7 +1439,8 @@ def create_s3_buckets(internal_name: str, environments: Sequence[str], ctx: Opti
         for env in environments:
             if env == "local":
                 continue
-            bucket_name = f"{internal_name}-{env}"
+            env_slug_value = environment_slug(env)
+            bucket_name = f"{internal_name}-{env_slug_value}"
             print(f"\nCreating S3 bucket '{bucket_name}' in {AWS_REGION}...")
             create_cmd = [
                 "aws",
@@ -1823,7 +1810,8 @@ def configure_railway_services(
     for env in environments:
         if env == "local":
             continue
-        service_name = f"{internal_name}-{env}-api"
+        env_slug_value = environment_slug(env)
+        service_name = f"{internal_name}-{env_slug_value}-api"
         repo_slug = repo_slug_for_railway(node_config.repo_url)
         add_command: List[str] = ["railway", "add", "--service", service_name]
         if repo_slug:
@@ -1888,7 +1876,7 @@ def step_configure_railway_services(ctx: ExecutionContext) -> None:
     services = configure_railway_services(
         ctx,
         ctx.config.app_internal_name,
-        ENVIRONMENTS,
+        ENVIRONMENT_KEYS,
         node_config,
     )
     ctx.add_step_data("railway_services", services)
@@ -2018,12 +2006,14 @@ def configure_godaddy_dns(
 
 
 def summarise_dns_instructions(app_public_name: str, internal_name: str) -> None:
+    production_slug = environment_slug("production")
+    beta_slug = environment_slug("beta")
     print(
         textwrap.dedent(
             f"""
             DNS configuration reminder:
-              - Point apex domain (e.g., {app_public_name}.com) to Firebase Hosting target `{internal_name}-prod`.
-              - Create subdomain `beta.{app_public_name}.com` pointing to `{internal_name}-beta`.
+              - Point apex domain (e.g., {app_public_name}.com) to Firebase Hosting target `{internal_name}-{production_slug}`.
+              - Create subdomain `beta.{app_public_name}.com` pointing to `{internal_name}-{beta_slug}`.
               - Configure both in GoDaddy (or registrar) AND in Firebase Hosting custom domains.
             """
         )
@@ -2143,6 +2133,10 @@ def insert_api_segment(internal_name: str) -> str:
     if parts[-1].isdigit():
         return "-".join(parts[:-1] + ["api", parts[-1]])
     return "-".join(parts + ["api"])
+
+
+def environment_slug(env_key: str) -> str:
+    return ENVIRONMENT_SLUGS.get(env_key, env_key)
 
 
 def generate_default_api_repo(internal_name: str, owner: Optional[str] = None) -> str:
@@ -2821,7 +2815,7 @@ def step_update_environment_files(ctx: ExecutionContext) -> None:
 
 def step_copy_build_directories(ctx: ExecutionContext) -> None:
     root = ctx.require_frontend_root()
-    created = copy_build_directories(root, ctx.config.app_internal_name, ENVIRONMENTS, ctx=ctx)
+    created = copy_build_directories(root, ctx.config.app_internal_name, ENVIRONMENT_KEYS, ctx=ctx)
     ctx.add_step_data("created_paths", [str(path) for path in created])
     if created:
         print(f"Duplicated {len(created)} build director{'ies' if len(created) != 1 else 'y'}.")
@@ -2864,7 +2858,7 @@ def rollback_disable_firestore(ctx: ExecutionContext) -> None:
 def step_create_firebase_hosting_sites(ctx: ExecutionContext) -> None:
     env_sites, created_sites = create_firebase_hosting_sites(
         ctx.config.firebase_project_id,
-        ENVIRONMENTS,
+        ENVIRONMENT_KEYS,
         ctx=ctx,
     )
     ctx.env_sites.update(env_sites)
@@ -2895,7 +2889,7 @@ def step_update_firebase_configs(ctx: ExecutionContext) -> None:
 
 
 def step_create_s3_buckets(ctx: ExecutionContext) -> None:
-    buckets = create_s3_buckets(ctx.config.app_internal_name, ENVIRONMENTS)
+    buckets = create_s3_buckets(ctx.config.app_internal_name, ENVIRONMENT_KEYS)
     ctx.add_step_data("created_buckets", buckets)
 
 

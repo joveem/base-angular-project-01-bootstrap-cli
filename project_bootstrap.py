@@ -1710,6 +1710,72 @@ def ensure_railway_project(
     return new_project_id, True
 
 
+def ensure_railway_environment(api_dir: Path, env_name: str) -> Optional[bool]:
+    if not env_name:
+        return False
+    set_result = run_command(
+        ["railway", "environment", env_name],
+        cwd=api_dir,
+        check=False,
+    )
+    if set_result.returncode == 0:
+        return False
+    create_result = run_command(
+        ["railway", "environment", "new", env_name],
+        cwd=api_dir,
+        check=False,
+    )
+    if create_result.returncode != 0:
+        print(
+            f"  Warning: Failed to create Railway environment '{env_name}'. "
+            "You may need to create it manually."
+        )
+        return None
+    run_command(
+        ["railway", "environment", env_name],
+        cwd=api_dir,
+        check=False,
+    )
+    print(f"  Railway environment ensured: {env_name}")
+    return True
+
+
+def ensure_railway_service(
+    api_dir: Path,
+    env_name: Optional[str],
+    service_name: str,
+    repo_url: Optional[str] = None,
+) -> Optional[bool]:
+    if env_name:
+        env_result = run_command(
+            ["railway", "environment", env_name],
+            cwd=api_dir,
+            check=False,
+        )
+        if env_result.returncode != 0:
+            print(
+                f"  Warning: Unable to switch to Railway environment '{env_name}' "
+                "before creating services."
+            )
+            return None
+    command: List[str] = ["railway", "add", "--service", service_name]
+    if repo_url:
+        command.extend(["--repo", repo_url])
+    add_result = run_command(command, cwd=api_dir, check=False)
+    if add_result.returncode == 0:
+        print(f"  Railway service created: {service_name}")
+        return True
+    combined = (add_result.stderr or add_result.stdout or "").lower()
+    if "already exists" in combined or "already in use" in combined or "service is already linked" in combined:
+        print(f"  Railway service '{service_name}' already exists; skipping creation.")
+        return False
+    print(
+        "  Warning: Failed to create Railway service "
+        f"'{service_name}': {add_result.stderr or add_result.stdout or 'unknown error'}"
+    )
+    return None
+
+
 def configure_railway_services(
     ctx: ExecutionContext,
     internal_name: str,
@@ -1721,7 +1787,10 @@ def configure_railway_services(
     cli_available = shutil.which("railway") is not None
     project_created = False
 
-    if cli_available and not ctx.config.dry_run:
+    api_dir = ctx.config.repo_parent / f"{internal_name}-api"
+    automation_base = cli_available and not ctx.config.dry_run and api_dir.exists()
+
+    if automation_base:
         ensured_id, created = ensure_railway_project(ctx, internal_name, node_config, cli_available)
         if ensured_id:
             project_id = ensured_id.strip()
@@ -1737,6 +1806,7 @@ def configure_railway_services(
                 )
                 node_config = ctx.config.node_api
         else:
+            automation_base = False
             project_id = (node_config.railway_project_id or "").strip()
 
     for env in environments:
@@ -1749,25 +1819,26 @@ def configure_railway_services(
         suggested_cmd = " ".join(add_command)
         deploy_branch = RAILWAY_BRANCH_MAP.get(env, node_config.branch or "")
 
-        link_command: Optional[str] = None
-        if project_id:
-            link_command = f"railway link --project {project_id}"
+        env_hint = RAILWAY_BRANCH_MAP.get(env, env)
 
         print(f"\nRailway provisioning for '{service_name}':")
-        if link_command:
-            print("  Link the CLI to the target project (run inside your API repo):")
-            print(f"    {link_command}")
-        else:
-            print("  Link the CLI to the desired Railway project before creating the service:")
-            print("    railway link")
 
-        env_hint = RAILWAY_BRANCH_MAP.get(env)
-        if cli_available:
-            print("  Create the service via CLI:")
-            print(f"    {suggested_cmd}")
+        manual_follow_up = True
+        automation_possible = automation_base and project_id
+
+        if automation_possible:
+            env_result = ensure_railway_environment(api_dir, env_hint) if env_hint else False
+            if env_result is not None:
+                service_result = ensure_railway_service(api_dir, env_hint, service_name, node_config.repo_url)
+                if service_result is not None:
+                    manual_follow_up = False
         else:
-            print("  Railway CLI not detected. Install it or use the Railway dashboard. Suggested command:")
-            print(f"    {suggested_cmd}")
+            if project_id:
+                print("  Link the CLI to the target project (run inside your API repo):")
+                print(f"    railway link --project {project_id}")
+            else:
+                print("  Link the CLI to the desired Railway project before creating the service:")
+                print("    railway link")
 
         if deploy_branch:
             print(f"  Recommended auto-deploy branch: {deploy_branch}")
@@ -1778,14 +1849,17 @@ def configure_railway_services(
         if node_config.root_dir and node_config.root_dir != ".":
             print(f"  If the repo is monorepo, set working directory: {node_config.root_dir}")
 
-        print("  After creation, verify environment variables and deploy settings in Railway.")
-
-        follow_up = f"Create Railway service '{service_name}' using 'railway add --service {service_name}'"
-        if project_id:
-            follow_up += f" after 'railway link --project {project_id}'"
+        if manual_follow_up:
+            print("  Automation could not create this service; follow the instructions below manually.")
+            follow_up = f"Create Railway service '{service_name}' using 'railway add --service {service_name}'"
+            if project_id:
+                follow_up += f" after 'railway link --project {project_id}'"
+            else:
+                follow_up += " after linking the CLI to the desired project/environment"
+            log_remaining(follow_up + ".")
         else:
-            follow_up += " after linking the CLI to the desired project/environment"
-        log_remaining(follow_up + ".")
+            print("  Railway service automation completed successfully.")
+
         created_services.append(service_name)
 
     if project_created and project_id:

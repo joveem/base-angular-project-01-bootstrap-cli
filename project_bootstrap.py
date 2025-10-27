@@ -987,11 +987,31 @@ def firebase_project_exists(project_id: str) -> Optional[bool]:
     except json.JSONDecodeError as exc:
         raise BootstrapError(f"Unexpected Firebase CLI output while checking projects: {exc}") from exc
 
-    projects = []
-    if isinstance(payload, dict):
-        projects = payload.get("results") or payload.get("projects") or []
-    elif isinstance(payload, list):
-        projects = payload
+    projects: List[Dict[str, Any]] = []
+
+    def _collect_projects(obj: Any) -> None:
+        if isinstance(obj, dict):
+            for key in ("result", "results", "projects", "items", "data"):
+                value = obj.get(key)
+                if isinstance(value, list):
+                    for entry in value:
+                        if isinstance(entry, dict):
+                            projects.append(entry)
+                elif isinstance(value, dict):
+                    _collect_projects(value)
+        elif isinstance(obj, list):
+            for entry in obj:
+                if isinstance(entry, dict):
+                    projects.append(entry)
+
+    _collect_projects(payload)
+
+    if not projects and isinstance(payload, dict):
+        for value in payload.values():
+            if isinstance(value, list):
+                for entry in value:
+                    if isinstance(entry, dict):
+                        projects.append(entry)
 
     exists = any(
         isinstance(entry, dict) and entry.get("projectId") == project_id

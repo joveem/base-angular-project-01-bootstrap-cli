@@ -1184,10 +1184,25 @@ def copy_build_directories(
     root: Path, internal_name: str, environments: Sequence[str], ctx: Optional[ExecutionContext] = None
 ) -> List[Path]:
     build_dir = root / ".build"
-    template_dir = build_dir / "EXAMPLE-web-site-01"
-    if not template_dir.exists():
-        print("Warning: .build/EXAMPLE-web-site-01 not found; skipping build dir duplication.")
+    preferred_templates = ["EXAMPLE-web-site-01", "EXAMPLE-website-01"]
+    template_dir: Optional[Path] = None
+
+    for name in preferred_templates:
+        candidate = build_dir / name
+        if candidate.exists():
+            template_dir = candidate
+            break
+
+    if template_dir is None and build_dir.exists():
+        for child in build_dir.iterdir():
+            if child.is_dir():
+                template_dir = child
+                break
+
+    if template_dir is None:
+        print("Warning: No template directory found under .build; skipping build dir duplication.")
         return []
+
     created: List[Path] = []
     for env in environments:
         if env == "local":

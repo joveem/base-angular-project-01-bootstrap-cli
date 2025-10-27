@@ -297,6 +297,25 @@ def remove_path_force(path: Path) -> None:
             path.unlink()
 
 
+def _prepare_command(command: Sequence[str]) -> List[str]:
+    if not command:
+        raise ValueError("Command cannot be empty.")
+
+    prepared = list(command)
+
+    if os.name == "nt":
+        executable = prepared[0]
+        has_path_sep = any(sep in executable for sep in ("\\", "/"))
+        if not has_path_sep and not Path(executable).is_absolute():
+            resolved = shutil.which(executable)
+            if resolved:
+                resolved_lower = resolved.lower()
+                if resolved_lower.endswith((".cmd", ".bat")):
+                    return ["cmd.exe", "/c", resolved, *prepared[1:]]
+                prepared[0] = resolved
+    return prepared
+
+
 @dataclass
 class ExecutionContext:
     args: argparse.Namespace
@@ -806,13 +825,15 @@ OPTIONAL_COMMANDS: Dict[str, Tuple[str, str]] = {
 
 def run_command(command: Sequence[str], cwd: Optional[Path] = None, check: bool = True) -> subprocess.CompletedProcess:
     """Run a subprocess command with echoing."""
-    print(f"\n$ {' '.join(command)}")
+    prepared = _prepare_command(command)
+    printable_cmd = " ".join(prepared)
+    print(f"\n$ {printable_cmd}")
     try:
-        result = subprocess.run(command, cwd=cwd, text=True, capture_output=True)
+        result = subprocess.run(prepared, cwd=cwd, text=True, capture_output=True)
     except FileNotFoundError as exc:
-        raise BootstrapError(f"90-02 | Failed to execute command '{' '.join(command)}': {exc}") from exc
+        raise BootstrapError(f"90-02 | Failed to execute command '{printable_cmd}': {exc}") from exc
     except Exception as exc:
-        raise BootstrapError(f"90-01 | Failed to execute command '{' '.join(command)}': {exc}") from exc
+        raise BootstrapError(f"90-01 | Failed to execute command '{printable_cmd}': {exc}") from exc
 
     if result.stdout:
         print(result.stdout)
@@ -822,7 +843,7 @@ def run_command(command: Sequence[str], cwd: Optional[Path] = None, check: bool 
     if check and result.returncode != 0:
         combined_output = (result.stderr or result.stdout or "").strip()
         extra = f"\n{combined_output}" if combined_output else ""
-        raise BootstrapError(f"Command failed ({result.returncode}): {' '.join(command)}{extra}")
+        raise BootstrapError(f"Command failed ({result.returncode}): {printable_cmd}{extra}")
     return result
 
 

@@ -1026,10 +1026,10 @@ def firebase_project_exists(project_id: str) -> Optional[bool]:
     return exists
 
 
-def create_firebase_project(project_id: str, display_name: str) -> bool:
+def create_firebase_project(project_id: str) -> bool:
     print(f"\nCreating Firebase project '{project_id}'...")
     try:
-        command = ["firebase", "projects:create", project_id, "--display-name", display_name, "--quiet"]
+        command = ["firebase", "projects:create", project_id, "--display-name", project_id, "--quiet"]
         result = run_command(command, check=False)
         if result.returncode != 0:
             stderr = (result.stderr or "").lower()
@@ -1037,7 +1037,7 @@ def create_firebase_project(project_id: str, display_name: str) -> bool:
             if "unknown option '--quiet'" in stderr or "unknown option '--quiet'" in stdout:
                 print("  Firebase CLI does not support --quiet; retrying without it.")
                 retry_result = run_command(
-                    ["firebase", "projects:create", project_id, "--display-name", display_name],
+                    ["firebase", "projects:create", project_id, "--display-name", project_id],
                     check=False,
                 )
                 result = retry_result
@@ -2494,7 +2494,7 @@ def step_create_firebase_project(ctx: ExecutionContext) -> None:
         ctx.add_step_data("project_created", False)
         return
 
-    created = create_firebase_project(project_id, ctx.config.app_public_name)
+    created = create_firebase_project(project_id)
     ctx.add_step_data("project_created", created)
 
 

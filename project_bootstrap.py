@@ -1126,7 +1126,7 @@ def enable_firestore(project_id: str) -> bool:
                         "create",
                         "--project",
                         project_id,
-                        "--region",
+                        "--location",
                         FIRESTORE_DEFAULT_LOCATION,
                     ],
                     check=False,

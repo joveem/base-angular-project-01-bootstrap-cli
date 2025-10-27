@@ -1525,13 +1525,24 @@ def configure_railway_services(
         suggested_cmd = " ".join(add_command)
         deploy_branch = RAILWAY_BRANCH_MAP.get(env, node_config.branch or "")
 
-        print(f"\nRailway provisioning for '{service_name}':")
+        link_command: Optional[str] = None
         if project_id:
-            print("  Link the CLI to the target project (run once from your API repo):")
-            print(f"    railway link --project {project_id}")
-        else:
-            print("  Link the CLI to the desired Railway project before creating the service (use 'railway link').")
+            link_parts: List[str] = ["railway", "link", "--project", project_id]
+            environment_hint = RAILWAY_BRANCH_MAP.get(env)
+            if environment_hint:
+                link_parts.extend(["--environment", environment_hint])
+            link_command = " ".join(link_parts)
 
+        print(f"\nRailway provisioning for '{service_name}':")
+        if link_command:
+            print("  Link the CLI to the target project/environment (run once inside your API repo):")
+            print(f"    {link_command}")
+        else:
+            print("  Link the CLI to the desired Railway project before creating the service:")
+            print("    railway link")
+            print("    railway environment <your-environment>")
+
+        env_hint = RAILWAY_BRANCH_MAP.get(env)
         if cli_available:
             print("  Create the service via CLI:")
             print(f"    {suggested_cmd}")
@@ -1550,9 +1561,15 @@ def configure_railway_services(
 
         print("  After creation, verify environment variables and deploy settings in Railway.")
 
-        log_remaining(
-            f"Create Railway service '{service_name}' using 'railway add --service {service_name}' (link project first)."
-        )
+        follow_up = f"Create Railway service '{service_name}' using 'railway add --service {service_name}'"
+        if project_id:
+            follow_up += f" after 'railway link --project {project_id}"
+            if env_hint:
+                follow_up += f" --environment {env_hint}"
+            follow_up += "'"
+        else:
+            follow_up += " after linking the CLI to the desired project/environment"
+        log_remaining(follow_up + ".")
         created_services.append(service_name)
     return created_services
 

@@ -232,6 +232,7 @@ class UserConfig:
     app_internal_name: str
     app_public_name: str
     repo_parent: Path
+    github_owner: str
     project_dir: Path
     should_clone: bool
     firebase_project_id: str
@@ -1916,7 +1917,7 @@ def step_sync_github_repositories(ctx: ExecutionContext) -> None:
     if shutil.which("gh") is None:
         log_remaining("Create GitHub repositories manually (gh CLI missing).")
         return
-    owner = detect_default_git_owner()
+    owner = ctx.config.github_owner or detect_default_git_owner()
     client_repo = ctx.config.project_dir.name
     try:
         ensure_github_repo(owner, client_repo)
@@ -2199,6 +2200,7 @@ class Questionnaire:
             for key in [
                 "app_internal_name",
                 "app_public_name",
+                "github_owner",
                 "should_clone",
                 "firebase_project",
                 "node_repo",
@@ -2219,6 +2221,7 @@ class Questionnaire:
             "stack",
             "app_internal_name",
             "app_public_name",
+            "github_owner",
             "should_clone",
             "firebase_project",
             *self.NODE_STEPS,
@@ -2274,6 +2277,8 @@ class Questionnaire:
             return self._ask_internal_name()
         if step_id == "app_public_name":
             return self._ask_public_name()
+        if step_id == "github_owner":
+            return self._ask_github_owner()
         if step_id == "should_clone":
             return self._ask_should_clone()
         if step_id == "firebase_project":
@@ -2359,6 +2364,22 @@ class Questionnaire:
             validator=validator,
         )
 
+    def _ask_github_owner(self) -> PromptOutcome:
+        previous = self.answers.get("github_owner")
+        default_owner = previous or self.default_owner
+
+        def validator(raw: str) -> Tuple[bool, Any, Optional[str]]:
+            value = raw.strip()
+            return (True, value, None) if value else (False, None, "Value cannot be empty. Try again.")
+
+        return self.prompt_manager.prompt_text(
+            "github_owner",
+            "GitHub owner (user or organization) for repositories:",
+            default=default_owner,
+            allow_empty=False,
+            validator=validator,
+        )
+
     def _ask_should_clone(self) -> PromptOutcome:
         internal_name = self.answers.get("app_internal_name", "<app>")
         project_dir = self.repo_parent / internal_name
@@ -2386,7 +2407,8 @@ class Questionnaire:
     def _ask_node_repo(self) -> PromptOutcome:
         internal_name = self.answers.get("app_internal_name", "")
         previous = self.answers.get("node_repo")
-        auto_default = generate_default_api_repo(internal_name, owner=self.default_owner) if internal_name else None
+        owner = self.answers.get("github_owner") or self.default_owner
+        auto_default = generate_default_api_repo(internal_name, owner=owner) if internal_name else None
         default = previous or auto_default
 
         def validator(raw: str) -> Tuple[bool, Any, Optional[str]]:
@@ -2511,6 +2533,9 @@ class Questionnaire:
         should_clone = bool(self.answers.get("should_clone", True))
 
         repo_parent = self.repo_parent
+        github_owner = (self.answers.get("github_owner") or self.default_owner).strip()
+        if not github_owner:
+            github_owner = self.default_owner
         project_dir = repo_parent / internal_name
 
         node_api_config: Optional[NodeAPIConfig] = None
@@ -2533,6 +2558,7 @@ class Questionnaire:
             app_internal_name=internal_name,
             app_public_name=public_name,
             repo_parent=repo_parent,
+            github_owner=github_owner,
             project_dir=project_dir,
             should_clone=should_clone,
             firebase_project_id=firebase_project,
@@ -2551,6 +2577,7 @@ class Questionnaire:
         for key in [
             "app_internal_name",
             "app_public_name",
+            "github_owner",
             "should_clone",
             "firebase_project",
             "node_repo",
@@ -3021,6 +3048,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print(f" - Stack: {config.stack.label}")
     print(f" - Features: {features_display}")
     print(f" - Project directory: {config.project_dir}")
+    print(f" - GitHub owner: {config.github_owner}")
     print(f" - Angular project root: {config.frontend_subdir}")
     print(f" - Clone template: {'yes' if config.should_clone else 'no'}")
     print(f" - Firebase project id: {config.firebase_project_id}")

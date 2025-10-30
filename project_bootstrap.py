@@ -1336,22 +1336,6 @@ def update_environment_files(root: Path, internal_name: str, features: Set[str],
         log_remaining("Environment files missing under src/environments; configure manually.")
         return 0
 
-    def desired_api_url(env_key: str) -> str:
-        slug = environment_slug(env_key)
-        if env_key == "local":
-            return "http://localhost:3000"
-        if "node_api" in features:
-            return f"https://{internal_name}-{slug}.up.railway.app"
-        return "http://localhost:2829" if env_key == "local" else "https://api.example.com"
-
-    def desired_cdn_url(env_key: str) -> str:
-        slug = environment_slug(env_key)
-        if env_key == "local":
-            return "http://localhost:2828"
-        if "aws_s3" in features:
-            return f"https://{internal_name}-{slug}.s3.{AWS_REGION}.amazonaws.com"
-        return f"https://{internal_name}-{slug}.web.app"
-
     updated_count = 0
 
     for path in env_files:
@@ -1375,15 +1359,35 @@ def update_environment_files(root: Path, internal_name: str, features: Set[str],
 
         env_slug_value = environment_slug(env_key)
 
+        def replace_property(content: str, prop: str, value: str) -> str:
+            pattern = rf"({prop}\s*:\s*)(['\"])([^'\"]*)(['\"])"
+            return re.sub(pattern, lambda match: f"{match.group(1)}{match.group(2)}{value}{match.group(2)}", content)
+
         updated = text
-        updated = re.sub(r"ENVIRONMENT_NAME:\s*'[^']*'", f"ENVIRONMENT_NAME: '{env_slug_value}'", updated)
-        updated = re.sub(r'ENVIRONMENT_NAME:\s*"[^"]*"', f'ENVIRONMENT_NAME: "{env_slug_value}"', updated)
+        updated = replace_property(updated, "ENVIRONMENT_NAME", env_slug_value)
 
-        updated = updated.replace("API_URL: 'http://localhost:2829'", f"API_URL: '{desired_api_url(env_key)}'")
-        updated = updated.replace('API_URL: "http://localhost:2829"', f'API_URL: "{desired_api_url(env_key)}"')
+        api_url = compute_api_url(internal_name, env_key, features)
+        updated = replace_property(updated, "API_URL", api_url)
 
-        updated = updated.replace("CDN_URL: 'http://localhost:2828'", f"CDN_URL: '{desired_cdn_url(env_key)}'")
-        updated = updated.replace('CDN_URL: "http://localhost:2828"', f'CDN_URL: "{desired_cdn_url(env_key)}"')
+        cdn_url = compute_cdn_url(internal_name, env_key, features)
+        updated = replace_property(updated, "CDN_URL", cdn_url)
+
+        project_id = ctx.config.firebase_project_id if ctx is not None else internal_name
+        updated = re.sub(
+            r'("projectId"\s*:\s*)"INSERT-PROJECT-ID"',
+            rf'\1"{project_id}"',
+            updated,
+        )
+        updated = re.sub(
+            r'("storageBucket"\s*:\s*)"INSERT-STORAGE-BUCKET"',
+            rf'\1"{project_id}.appspot.com"',
+            updated,
+        )
+        updated = re.sub(
+            r'("authDomain"\s*:\s*)"INSERT-AUTH-DOMAIN"',
+            rf'\1"{project_id}.firebaseapp.com"',
+            updated,
+        )
 
         if updated != text:
             if ctx is not None:
@@ -1393,10 +1397,71 @@ def update_environment_files(root: Path, internal_name: str, features: Set[str],
     return updated_count
 
 
+def update_build_directory_configs(
+    destination: Path,
+    env_key: str,
+    firebase_project_id: str,
+    ctx: Optional[ExecutionContext] = None,
+) -> bool:
+    changed = False
+    env_slug_value = environment_slug(env_key)
+    site_id = f"{firebase_project_id}-{env_slug_value}"
+
+    firebaserc_path = destination / ".firebaserc"
+    if firebaserc_path.exists():
+        original = firebaserc_path.read_text(encoding="utf-8")
+        try:
+            data = json.loads(original)
+        except json.JSONDecodeError as exc:
+            raise BootstrapError(f"Invalid JSON in {firebaserc_path}: {exc}") from exc
+        projects = data.setdefault("projects", {})
+        if not isinstance(projects, dict):
+            data["projects"] = {"default": firebase_project_id}
+        else:
+            if projects.get("default") != firebase_project_id:
+                projects["default"] = firebase_project_id
+        updated_firebaserc = json.dumps(data, indent=2) + "\n"
+        if updated_firebaserc != original:
+            if ctx is not None:
+                ctx.record_file_backup(firebaserc_path, original)
+            firebaserc_path.write_text(updated_firebaserc, encoding="utf-8")
+            changed = True
+
+    firebase_json_path = destination / "firebase.json"
+    if firebase_json_path.exists():
+        original = firebase_json_path.read_text(encoding="utf-8")
+        try:
+            data = json.loads(original)
+        except json.JSONDecodeError as exc:
+            raise BootstrapError(f"Invalid JSON in {firebase_json_path}: {exc}") from exc
+        hosting_configs = data.get("hosting")
+        if isinstance(hosting_configs, dict):
+            hosting_configs = [hosting_configs]
+        if not isinstance(hosting_configs, list):
+            raise BootstrapError(f"Unrecognised firebase.json structure in {firebase_json_path}")
+        updated = False
+        for cfg in hosting_configs:
+            if isinstance(cfg, dict) and cfg.get("site") != site_id:
+                cfg["site"] = site_id
+                updated = True
+        if updated:
+            updated_firebase_json = json.dumps(data, indent=4) + "\n"
+            if ctx is not None:
+                ctx.record_file_backup(firebase_json_path, original)
+            firebase_json_path.write_text(updated_firebase_json, encoding="utf-8")
+            changed = True
+
+    return changed
+
+
 
 def copy_build_directories(
-    root: Path, internal_name: str, environments: Sequence[str], ctx: Optional[ExecutionContext] = None
-) -> List[Path]:
+    root: Path,
+    internal_name: str,
+    firebase_project_id: str,
+    environments: Sequence[str],
+    ctx: Optional[ExecutionContext] = None,
+) -> Tuple[List[Path], List[Path]]:
     build_dir = root / ".build"
     preferred_templates = ["EXAMPLE-web-site-01", "EXAMPLE-website-01"]
     template_dir: Optional[Path] = None
@@ -1415,22 +1480,115 @@ def copy_build_directories(
 
     if template_dir is None:
         print("Warning: No template directory found under .build; skipping build dir duplication.")
-        return []
+        return [], []
 
     created: List[Path] = []
+    updated: List[Path] = []
     for env in environments:
         if env == "local":
             continue
         env_slug_value = environment_slug(env)
         destination = build_dir / f"{internal_name}-{env_slug_value}"
+        created_now = False
         if destination.exists():
-            print(f"  Build directory {destination} already exists. Skipping.")
+            print(f"  Build directory {destination} already exists. Skipping copy.")
+        else:
+            shutil.copytree(template_dir, destination)
+            if ctx is not None:
+                ctx.record_created_path(destination)
+            created.append(destination)
+            created_now = True
+            print(f"  Build directory created: {destination}")
+        if destination.exists():
+            if update_build_directory_configs(
+                destination,
+                env,
+                firebase_project_id,
+                ctx=ctx,
+            ):
+                updated.append(destination)
+                print(f"  Updated Firebase build configuration for {destination.name}.")
+            elif created_now:
+                # Ensure freshly created directories are tracked even when no changes were required
+                updated.append(destination)
+    return created, updated
+
+
+def generate_app_config_file(
+    root: Path,
+    internal_name: str,
+    features: Set[str],
+    ctx: Optional[ExecutionContext] = None,
+) -> str:
+    example_path = root / ".app.config.EXAMPLE.json"
+    if not example_path.exists():
+        return "missing"
+
+    try:
+        template = json.loads(example_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise BootstrapError(f"Invalid JSON in {example_path}: {exc}") from exc
+
+    data = json.loads(json.dumps(template))
+
+    env_configs = data.get("AppConfigByEnviroment")
+    if not isinstance(env_configs, dict):
+        raise BootstrapError("Invalid .app.config template: 'AppConfigByEnviroment' must be an object.")
+
+    for env_key, env_config in env_configs.items():
+        if not isinstance(env_config, dict):
             continue
-        shutil.copytree(template_dir, destination)
+        slug = environment_slug(env_key)
+        identifier = f"{internal_name}-{slug}"
+        env_config["HostingName"] = identifier
+        env_config["CdnS3BucketName"] = identifier
+
+        text_replacements = env_config.get("TextReplacingList")
+        if isinstance(text_replacements, list):
+            for entry in text_replacements:
+                if not isinstance(entry, dict):
+                    continue
+                original = entry.get("OriginalText")
+                if not isinstance(original, str):
+                    continue
+                if "localhost:2828" in original:
+                    if env_key == "local":
+                        replacement = "http://localhost:2828/"
+                    else:
+                        cdn_url = compute_cdn_url(internal_name, env_key, features).rstrip("/") + "/"
+                        replacement = cdn_url
+                    entry["ReplaceText"] = replacement
+                elif "localhost:2829" in original:
+                    if env_key == "local":
+                        replacement = "http://localhost:2829/"
+                    else:
+                        api_url = compute_api_url(internal_name, env_key, features).rstrip("/") + "/"
+                        replacement = api_url
+                    entry["ReplaceText"] = replacement
+
+    package_json = root / "package.json"
+    if package_json.exists():
+        try:
+            package_data = json.loads(package_json.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            package_data = {}
+        version_value = package_data.get("version")
+        if isinstance(version_value, str) and version_value.strip():
+            data["AppVersion"] = version_value.strip()
+
+    target_path = root / ".app.config.json"
+    new_content = json.dumps(data, indent=4) + "\n"
+    if target_path.exists():
+        current_content = target_path.read_text(encoding="utf-8")
+        if current_content == new_content:
+            return "unchanged"
         if ctx is not None:
-            ctx.record_created_path(destination)
-        created.append(destination)
-    return created
+            ctx.record_file_backup(target_path, current_content)
+    else:
+        if ctx is not None:
+            ctx.record_created_path(target_path)
+    target_path.write_text(new_content, encoding="utf-8")
+    return "updated"
 
 
 def create_s3_buckets(internal_name: str, environments: Sequence[str], ctx: Optional[ExecutionContext] = None) -> List[str]:
@@ -1896,8 +2054,11 @@ def ensure_github_repo(owner: str, repo_name: str, visibility: str = "private") 
 
 def configure_git_remote_and_push(repo_path: Path, owner: str, repo_name: str, branch: str) -> None:
     repo_url = f"git@github.com:{owner}/{repo_name}.git"
+    remote_suffix = "".join(owner.lower().split()) or "origin"
+    remote_name = f"github-{remote_suffix}"
+    run_command(["git", "remote", "remove", remote_name], cwd=repo_path, check=False)
     run_command(["git", "remote", "remove", "origin"], cwd=repo_path, check=False)
-    run_command(["git", "remote", "add", "origin", repo_url], cwd=repo_path)
+    run_command(["git", "remote", "add", remote_name, repo_url], cwd=repo_path)
     run_command(["git", "checkout", "-B", branch], cwd=repo_path)
     run_command(["git", "add", "-A"], cwd=repo_path)
     commit = run_command(["git", "commit", "-m", "chore: bootstrap project"], cwd=repo_path, check=False)
@@ -1907,7 +2068,7 @@ def configure_git_remote_and_push(repo_path: Path, owner: str, repo_name: str, b
         combined = (commit.stdout + commit.stderr).lower()
         if "nothing to commit" not in combined:
             raise BootstrapError("Git commit failed: unable to create initial commit.")
-    run_command(["git", "push", "-u", "origin", branch], cwd=repo_path)
+    run_command(["git", "push", "-u", remote_name, branch], cwd=repo_path)
 
 
 def step_sync_github_repositories(ctx: ExecutionContext) -> None:
@@ -2098,6 +2259,16 @@ def detect_default_git_owner() -> str:
         if owner:
             return owner
 
+    remotes = _run_git_command(["remote"])
+    if remotes:
+        for remote in remotes.split():
+            remote_url = _run_git_command(["config", "--get", f"remote.{remote}.url"])
+            if not remote_url:
+                continue
+            owner = _parse_github_owner_from_remote(remote_url)
+            if owner:
+                return owner
+
     return DEFAULT_GITHUB_OWNER
 
 
@@ -2138,6 +2309,24 @@ def insert_api_segment(internal_name: str) -> str:
 
 def environment_slug(env_key: str) -> str:
     return ENVIRONMENT_SLUGS.get(env_key, env_key)
+
+
+def compute_api_url(internal_name: str, env_key: str, features: Set[str]) -> str:
+    slug = environment_slug(env_key)
+    if env_key == "local":
+        return "http://localhost:3000"
+    if "node_api" in features:
+        return f"https://{internal_name}-{slug}.up.railway.app"
+    return "http://localhost:2829" if env_key == "local" else "https://api.example.com"
+
+
+def compute_cdn_url(internal_name: str, env_key: str, features: Set[str]) -> str:
+    slug = environment_slug(env_key)
+    if env_key == "local":
+        return "http://localhost:2828"
+    if "aws_s3" in features:
+        return f"https://{internal_name}-{slug}.s3.{AWS_REGION}.amazonaws.com"
+    return f"https://{internal_name}-{slug}.web.app"
 
 
 def generate_default_api_repo(internal_name: str, owner: Optional[str] = None) -> str:
@@ -2842,14 +3031,49 @@ def step_update_environment_files(ctx: ExecutionContext) -> None:
 
 def step_copy_build_directories(ctx: ExecutionContext) -> None:
     root = ctx.require_frontend_root()
-    created = copy_build_directories(root, ctx.config.app_internal_name, ENVIRONMENT_KEYS, ctx=ctx)
+    created, updated = copy_build_directories(
+        root,
+        ctx.config.app_internal_name,
+        ctx.config.firebase_project_id,
+        ENVIRONMENT_KEYS,
+        ctx=ctx,
+    )
     ctx.add_step_data("created_paths", [str(path) for path in created])
+    ctx.add_step_data("updated_build_directories", [str(path) for path in updated])
     if created:
         print(f"Duplicated {len(created)} build director{'ies' if len(created) != 1 else 'y'}.")
+    if updated:
+        print(f"Applied build configuration updates for {len(updated)} environment{'s' if len(updated) != 1 else ''}.")
+
+
+def step_generate_app_config(ctx: ExecutionContext) -> None:
+    root = ctx.require_frontend_root()
+    status = generate_app_config_file(root, ctx.config.app_internal_name, ctx.config.stack.features, ctx=ctx)
+    ctx.add_step_data("app_config_status", status)
+    if status == "missing":
+        print(".app.config.EXAMPLE.json not found; skipping app config generation.")
+    elif status == "updated":
+        print(".app.config.json generated or updated.")
+    else:
+        print(".app.config.json already up to date.")
 
 
 def rollback_remove_generated_paths(ctx: ExecutionContext) -> None:
     ctx.remove_created_paths()
+
+
+def rollback_app_config_changes(ctx: ExecutionContext) -> None:
+    errors: List[str] = []
+    try:
+        ctx.restore_files()
+    except BootstrapError as exc:
+        errors.append(str(exc))
+    try:
+        ctx.remove_created_paths()
+    except BootstrapError as exc:
+        errors.append(str(exc))
+    if errors:
+        raise BootstrapError("; ".join(errors))
 
 
 def step_create_firebase_project(ctx: ExecutionContext) -> None:
@@ -2964,6 +3188,7 @@ def build_steps(ctx: ExecutionContext) -> List[Step]:
         Step("Replace project placeholders", step_replace_placeholders, rollback_restore_files),
         Step("Update Angular environment files", step_update_environment_files, rollback_restore_files),
         Step("Copy build directories", step_copy_build_directories, rollback_remove_generated_paths),
+        Step("Generate app config file", step_generate_app_config, rollback_app_config_changes),
     ]
 
     features = ctx.config.stack.features

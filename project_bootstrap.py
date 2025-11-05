@@ -1620,6 +1620,40 @@ def create_s3_buckets(internal_name: str, environments: Sequence[str], ctx: Opti
                     continue
                 raise BootstrapError(f"Failed to create bucket {bucket_name}: {result.stderr or result.stdout or 'unknown error'}")
 
+            ownership_controls = json.dumps({"Rules": [{"ObjectOwnership": "BucketOwnerPreferred"}]})
+            print("  Ensuring bucket allows ACL-managed objects...")
+            run_command(
+                [
+                    "aws",
+                    "s3api",
+                    "put-bucket-ownership-controls",
+                    "--bucket",
+                    bucket_name,
+                    "--ownership-controls",
+                    ownership_controls,
+                ]
+            )
+
+            public_access_block = json.dumps(
+                {
+                    "BlockPublicAcls": False,
+                    "IgnorePublicAcls": False,
+                    "BlockPublicPolicy": False,
+                    "RestrictPublicBuckets": False,
+                }
+            )
+            run_command(
+                [
+                    "aws",
+                    "s3api",
+                    "put-public-access-block",
+                    "--bucket",
+                    bucket_name,
+                    "--public-access-block-configuration",
+                    public_access_block,
+                ]
+            )
+
             policy = {
                 "Version": "2012-10-17",
                 "Statement": [
@@ -1697,6 +1731,21 @@ def create_s3_buckets(internal_name: str, environments: Sequence[str], ctx: Opti
                     f"{cors_result.stderr or cors_result.stdout or 'unknown error'}"
                 )
             created.append(bucket_name)
+
+            placeholder_path = tmpdir_path / f"{bucket_name}-placeholder.keep"
+            placeholder_path.write_text("", encoding="utf-8")
+            run_command(
+                [
+                    "aws",
+                    "s3",
+                    "cp",
+                    str(placeholder_path),
+                    f"s3://{bucket_name}/public/.keep",
+                    "--acl",
+                    "public-read",
+                ]
+            )
+            print("  Created placeholder object at s3://%s/public/.keep." % bucket_name)
     return created
 
 

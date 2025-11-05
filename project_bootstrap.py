@@ -924,6 +924,7 @@ def git_clone_template(target_dir: Path, repo_url: str = TEMPLATE_REPO_URL) -> P
         raise BootstrapError(f"Temporary path {temp_dir} already exists. Please remove it first.")
     run_command(["git", "clone", repo_url], cwd=parent)
     temp_dir.rename(target_dir)
+    run_command(["git", "submodule", "update", "--init", "--recursive"], cwd=target_dir)
     return target_dir
 
 
@@ -938,6 +939,7 @@ def git_clone_repo(repo_url: str, expected_dirname: str, target_dir: Path) -> Pa
     if not temp_dir.exists():
         raise BootstrapError(f"Cloned repository expected at {temp_dir} but was not found.")
     temp_dir.rename(target_dir)
+    run_command(["git", "submodule", "update", "--init", "--recursive"], cwd=target_dir)
     return target_dir
 
 
@@ -963,6 +965,53 @@ def replace_placeholders(
                 path.write_text(content, encoding="utf-8")
                 changed += 1
     return changed
+
+
+def _replace_in_path(path: Path, replacements: Sequence[Tuple[str, str]], ctx: Optional[ExecutionContext]) -> bool:
+    try:
+        content = path.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError):
+        return False
+    original = content
+    for old, new in replacements:
+        if old in content:
+            content = content.replace(old, new)
+    if content == original:
+        return False
+    if ctx is not None:
+        ctx.record_file_backup(path, original)
+    path.write_text(content, encoding="utf-8")
+    return True
+
+
+def replace_project_identifiers_in_frontend(
+    frontend_root: Path,
+    internal_name: str,
+    public_name: str,
+    ctx: Optional[ExecutionContext] = None,
+) -> int:
+    public_compact = public_name.replace(" ", "").lower()
+    replacements: Sequence[Tuple[str, str]] = (
+        ("/BASE-ANGULAR-PROJECT-01", f"/{internal_name}"),
+        ("BASE-ANGULAR-PROJECT-PUBLIC-NAME-01", public_name),
+        ("BASE-ANGULAR-PROJECT-PUBLIC-NAME-LOWERCASE-NO-SPACE-01", public_compact),
+        ("BASE-ANGULAR-PROJECT-01", internal_name),
+        ("base-angular-projects-01", internal_name),
+    )
+
+    updated = 0
+
+    src_dir = frontend_root / "src"
+    if src_dir.exists():
+        for path in src_dir.rglob("*"):
+            if path.is_file() and _replace_in_path(path, replacements, ctx):
+                updated += 1
+
+    for path in frontend_root.iterdir():
+        if path.is_file() and _replace_in_path(path, replacements, ctx):
+            updated += 1
+
+    return updated
 
 
 def firebase_project_exists(project_id: str) -> Optional[bool]:
@@ -3062,8 +3111,23 @@ def step_resolve_frontend_root(ctx: ExecutionContext) -> None:
 
 def step_replace_placeholders(ctx: ExecutionContext) -> None:
     changed = replace_placeholders(ctx.config.project_dir, ctx.replacements, ctx=ctx)
-    ctx.add_step_data("files_changed", changed)
+    frontend_root = ctx.require_frontend_root()
+    identifier_updates = replace_project_identifiers_in_frontend(
+        frontend_root,
+        ctx.config.app_internal_name,
+        ctx.config.app_public_name,
+        ctx=ctx,
+    )
+    ctx.add_step_data(
+        "files_changed",
+        {
+            "placeholders": changed,
+            "project_identifiers": identifier_updates,
+        },
+    )
     print(f"Updated placeholders in {changed} file(s).")
+    if identifier_updates:
+        print(f"Updated project identifiers in {identifier_updates} file(s).")
 
 
 def rollback_restore_files(ctx: ExecutionContext) -> None:
